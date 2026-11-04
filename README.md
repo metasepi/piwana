@@ -66,3 +66,8 @@ The fetch command only retries records with an empty abstract and status `pendin
 ## Scope and limitations
 
 This is an initial DOI-to-abstract retrieval path, not the full proceedings collector. Coverage depends on whether the metadata providers have an abstract for a DOI. The next step is to test with several real DOI records and compare the results against the publishers' official proceedings. The current implementation uses the `curl` executable for HTTPS requests.
+
+
+### Abstract retrieval sources
+
+The `--fetch-abstracts` command tries sources in this order: Crossref, Semantic Scholar, OpenAlex, and (for ACM DOI pages) the ACM Digital Library HTML metadata. OpenAlex abstracts are reconstructed from `abstract_inverted_index`. Retrieval stops at the first non-empty abstract. Failed attempts are retried on the next run. Publisher pages may block automated requests or omit machine-readable abstract metadata; in that case the paper remains unavailable rather than being treated as proof that no abstract exists.

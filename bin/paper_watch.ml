@@ -204,9 +204,9 @@ let percent_encode_path s =
     | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
   Buffer.contents b
 
-let http_get url =
-  let command = "curl -fsSL --connect-timeout 8 --max-time 25 -H " ^
-    shell_quote "Accept: application/json" ^ " " ^ shell_quote url ^ " 2>/dev/null" in
+let http_get_with_headers headers url =
+  let header_args = String.concat " " (List.map (fun h -> "-H " ^ shell_quote h) headers) in
+  let command = "curl -fsSL --connect-timeout 8 --max-time 25 " ^ header_args ^ " " ^ shell_quote url ^ " 2>/dev/null" in
   let ic = Unix.open_process_in command in
   let contents =
     let b = Buffer.create 4096 in
@@ -216,6 +216,9 @@ let http_get url =
   match Unix.close_process_in ic with
   | Unix.WEXITED 0 -> Some contents
   | _ -> None
+
+let http_get url = http_get_with_headers ["Accept: application/json"; "User-Agent: paper-watch/0.1 (academic literature review)"] url
+let http_get_html url = http_get_with_headers ["Accept: text/html,application/xhtml+xml"; "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"] url
 
 let json_field key = function
   | `Assoc fields -> (try List.assoc key fields with Not_found -> `Null)
@@ -294,6 +297,68 @@ let semantic_scholar_record doi =
         Some (abstract, title, authors, year)
        with _ -> None)
 
+let openalex_record doi =
+  let url = "https://api.openalex.org/works/https://doi.org/" ^ percent_encode_path doi in
+  match http_get url with
+  | None -> None
+  | Some body ->
+      (try
+        let obj = Yojson.Basic.from_string body in
+        let inverted = json_field "abstract_inverted_index" obj in
+        let words = match inverted with
+          | `Assoc entries ->
+              List.concat (List.map (fun (word, positions) -> match positions with
+                | `List ps -> List.filter_map (function `Int n -> Some (n, word) | _ -> None) ps
+                | _ -> []) entries)
+          | _ -> [] in
+        let abstract = words |> List.sort (fun (a,_) (b,_) -> compare a b)
+          |> List.map snd |> String.concat " " in
+        let title = json_string (json_field "title" obj) in
+        let year = json_string (json_field "publication_year" obj) in
+        Some (abstract, title, "", year)
+       with _ -> None)
+
+let html_attribute tag attr =
+  let lower = String.lowercase_ascii tag in
+  let needle = String.lowercase_ascii attr ^ "=" in
+  let rec find i =
+    if i + String.length needle > String.length lower then ""
+    else if String.sub lower i (String.length needle) = needle then (
+      let start = i + String.length needle in
+      if start >= String.length tag then "" else
+      let quote = tag.[start] in
+      if quote = '\'' || quote = '"' then (
+        try let stop = String.index_from tag (start + 1) quote in String.sub tag (start + 1) (stop - start - 1)
+        with Not_found -> "")
+      else
+        let stop = try String.index_from tag start ' ' with Not_found -> String.length tag in
+        String.sub tag start (stop - start))
+    else find (i + 1)
+  in find 0
+
+let acm_record doi =
+  let url = "https://dl.acm.org/doi/" ^ percent_encode_path doi in
+  match http_get_html url with
+  | None -> None
+  | Some html ->
+      let rec tags i acc =
+        try
+          let start = String.index_from html i '<' in
+          let stop = String.index_from html start '>' in
+          let tag = String.sub html start (stop - start + 1) in
+          let acc = if String.length tag >= 4 && String.lowercase_ascii (String.sub tag 0 4) = "<met" then
+            let name = String.lowercase_ascii (html_attribute tag "name") in
+            let prop = String.lowercase_ascii (html_attribute tag "property") in
+            let content = html_attribute tag "content" in
+            if name = "citation_abstract" || name = "dc.description" || prop = "og:description" then content :: acc else acc
+            else acc in
+          tags (stop + 1) acc
+        with Not_found -> List.rev acc
+      in
+      let abstracts = tags 0 [] in
+      let abstract = match abstracts with x :: _ -> html_to_text x | [] -> "" in
+      if abstract = "" then None else Some (abstract, "", "", "")
+
 let update_paper_metadata db id source abstract title authors year =
   let stamp = sql_quote (now_iso ()) in
   exec db (Printf.sprintf
@@ -316,23 +381,35 @@ let fetch_abstracts db =
   let ok = ref 0 and missing = ref 0 in
   List.iter (fun (id, doi) ->
     Printf.printf "Fetching %s ... %!" doi;
+    let crossref = crossref_record doi in
     let result =
-      match crossref_record doi with
-      | Some (abstract, title, authors, year) when abstract <> "" -> Some ("crossref", abstract, title, authors, year)
-      | crossref ->
-          (match semantic_scholar_record doi with
-           | Some (abstract, title, authors, year) when abstract <> "" -> Some ("semantic_scholar", abstract,
-               (if title <> "" then title else match crossref with Some (_,t,_,_) -> t | _ -> ""),
-               (if authors <> "" then authors else match crossref with Some (_,_,a,_) -> a | _ -> ""),
-               (if year <> "" then year else match crossref with Some (_,_,_,y) -> y | _ -> ""))
-           | _ -> None)
+      let candidates = [
+        ("crossref", (fun () -> crossref));
+        ("semantic_scholar", (fun () -> semantic_scholar_record doi));
+        ("openalex", (fun () -> openalex_record doi));
+        ("acm", (fun () -> acm_record doi))
+      ] in
+      let rec choose = function
+        | [] -> None
+        | (source, fetch) :: rest ->
+            (match fetch () with
+             | Some (abstract, title, authors, year) when abstract <> "" ->
+                 let fallback = match crossref with Some (_, t, a, y) -> (t,a,y) | None -> ("","","") in
+                 let ft, fa, fy = fallback in
+                 Some (source, abstract,
+                   (if title <> "" then title else ft),
+                   (if authors <> "" then authors else fa),
+                   (if year <> "" then year else fy))
+             | _ -> choose rest)
+      in
+      choose candidates
     in
     match result with
     | Some (source, abstract, title, authors, year) ->
         update_paper_metadata db id source abstract title authors year;
         incr ok; Printf.printf " %s (%d chars)\n%!" source (String.length abstract)
     | None ->
-        exec db (Printf.sprintf "UPDATE papers SET abstract_status='not_found',abstract_fetched_at=%s,abstract_error='No abstract returned by Crossref or Semantic Scholar' WHERE id=%s"
+        exec db (Printf.sprintf "UPDATE papers SET abstract_status='not_found',abstract_fetched_at=%s,abstract_error='No abstract returned by Crossref, Semantic Scholar, OpenAlex, or ACM' WHERE id=%s"
           (sql_quote (now_iso ())) (sql_quote id));
         incr missing; print_endline " not found"
   ) rows;
