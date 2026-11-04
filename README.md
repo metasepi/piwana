@@ -76,3 +76,16 @@ This is an initial DOI-to-abstract retrieval path, not the full proceedings coll
 ### Abstract retrieval sources
 
 The `--fetch-abstracts` command tries sources in this order: Crossref, Semantic Scholar, OpenAlex, and (for ACM DOI pages) the ACM Digital Library HTML metadata. OpenAlex abstracts are reconstructed from `abstract_inverted_index`. Retrieval stops at the first non-empty abstract. Failed attempts are retried on the next run. Publisher pages may block automated requests or omit machine-readable abstract metadata; in that case the paper remains unavailable rather than being treated as proof that no abstract exists.
+
+
+## Official proceedings collection (experimental)
+
+Collect OSDI papers from the official USENIX Technical Sessions page:
+
+```sh
+dune exec ./bin/paper_watch.exe -- --collect OSDI 2026
+```
+
+The collector stores a stable edition/title-derived ID, title, authors, abstract, official presentation URL, source page URL, and collection timestamp. It does not overwrite review decisions. OSDI records currently have no DOI unless one is resolved separately. This first parser is experimental: compare the reported number of parsed records against the official table of contents before treating a run as complete.
+
+The collector requires `curl` and network access. It adds `official_url`, `collection_source`, and `collected_at` columns automatically to existing databases.

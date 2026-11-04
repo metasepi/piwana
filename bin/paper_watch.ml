@@ -90,7 +90,10 @@ let init_schema db =
   in
   ensure_column "abstract_fetched_at" "TEXT";
   ensure_column "abstract_status" "TEXT NOT NULL DEFAULT 'pending'";
-  ensure_column "abstract_error" "TEXT"
+  ensure_column "abstract_error" "TEXT";
+  ensure_column "official_url" "TEXT";
+  ensure_column "collection_source" "TEXT";
+  ensure_column "collected_at" "TEXT"
 
 let scalar_int db sql =
   let stmt = Sqlite3.prepare db sql in
@@ -435,6 +438,100 @@ let import_dois db path =
   done with End_of_file -> close_in ic);
   Printf.printf "Imported %d DOI(s) from %s.\n%!" !added path
 
+
+let html_unescape s =
+  let replacements = ["&amp;", "&"; "&lt;", "<"; "&gt;", ">"; "&quot;", "\""; "&#39;", "'"; "&#x27;", "'"] in
+  List.fold_left (fun acc (a,b) ->
+    let re = Str.regexp_string a in Str.global_replace re b acc) s replacements
+
+let strip_html s =
+  let s = Str.global_replace (Str.regexp "<[^>]*>") " " s in
+  let s = html_unescape s in
+  Str.global_replace (Str.regexp "[ \t\r\n]+") " " s |> String.trim
+
+let attr_value tag name =
+  let re = Str.regexp_case_fold (name ^ "[ \t]*=[ \t]*[\"']\\([^\"']+\\)[\"']") in
+  try ignore (Str.search_forward re tag 0); Str.matched_group 1 tag with _ -> ""
+
+let parse_usenix_papers html =
+  (* Locate each heading explicitly; avoid a greedy expression spanning multiple h2 blocks. *)
+  let rec headings pos acc =
+    try
+      ignore (Str.search_forward (Str.regexp_case_fold "<h2[^>]*>") html pos);
+      let open_end = Str.match_end () in
+      let close = Str.search_forward (Str.regexp_case_fold "</h2>") html open_end in
+      let heading = String.sub html open_end (close-open_end) in
+      let end_pos = Str.match_end () in
+      let anchor_re = Str.regexp_case_fold "<a[^>]*>\\([^<]*\\)</a>" in
+      let href_re = Str.regexp_case_fold "<a[^>]*>" in
+      let title = try ignore (Str.search_forward anchor_re heading 0); Str.matched_group 1 heading |> strip_html with _ -> "" in
+      let href = try ignore (Str.search_forward href_re heading 0); attr_value (Str.matched_string heading) "href" with _ -> "" in
+      let acc = if title <> "" && href <> "" && String.length href > 0 then (end_pos,title,href)::acc else acc in
+      headings end_pos acc
+    with Not_found -> List.rev acc
+  in
+  let hs = headings 0 [] in
+  let rec make = function
+    | [] -> []
+    | (body_start,title,href)::rest ->
+        let body_end = match rest with (next,_,_)::_ -> next | [] -> String.length html in
+        let body = String.sub html body_start (max 0 (body_end-body_start)) |> strip_html in
+        let tokens = String.split_on_char ' ' body |> List.filter ((<>) "") in
+        let authors = match tokens with
+          | [] -> ""
+          | _ ->
+              (* The author block precedes the first "Available Media" marker. *)
+              let re = Str.regexp_case_fold "Available Media" in
+              (try let i = Str.search_forward re body 0 in String.sub body 0 i |> String.trim
+               with Not_found -> "")
+        in
+        let abstract =
+          let re = Str.regexp_case_fold "Available Media" in
+          try ignore (Str.search_forward re body 0);
+            let tail = String.sub body (Str.match_end ()) (String.length body - Str.match_end ()) |> String.trim in
+            let tail = Str.global_replace (Str.regexp "^Operational Systems Paper[ \t]*") "" tail in
+            tail
+          with Not_found -> ""
+        in
+        let absolute = if String.length href > 0 && href.[0] = '/' then "https://www.usenix.org" ^ href else href in
+        (title, String.trim authors, abstract, absolute) :: make rest
+  in
+  make hs
+
+let slugify s =
+  let b = Buffer.create (String.length s) in
+  let dash = ref false in
+  String.iter (fun c ->
+    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') then
+      (if !dash && Buffer.length b > 0 then Buffer.add_char b '-';
+       dash := false; Buffer.add_char b (Char.lowercase_ascii c))
+    else dash := true) s;
+  Buffer.contents b
+
+let collect_osdi db year =
+  let short_year = if String.length year >= 2 then String.sub year (String.length year-2) 2 else year in
+  let url = "https://www.usenix.org/conference/osdi" ^ short_year ^ "/technical-sessions" in
+  Printf.printf "Fetching official proceedings: %s\n%!" url;
+  match http_get_html url with
+  | None -> failwith ("Could not fetch official USENIX page: " ^ url)
+  | Some html ->
+      let papers = parse_usenix_papers html in
+      let inserted = ref 0 in
+      List.iter (fun (title,authors,abstract,official_url) ->
+        let id = "osdi:" ^ year ^ ":" ^ slugify title in
+        let stamp = sql_quote (now_iso ()) in
+        let doi = "NULL" in
+        exec db (Printf.sprintf
+          "INSERT INTO papers(id,doi,title,authors,conference,year,abstract_en,metadata_source,abstract_source,metadata_updated_at,abstract_fetched_at,abstract_status,official_url,collection_source,collected_at) VALUES(%s,%s,%s,%s,'OSDI',%s,%s,'usenix_official','usenix_official',%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET title=excluded.title,authors=excluded.authors,abstract_en=CASE WHEN excluded.abstract_en<>'' THEN excluded.abstract_en ELSE papers.abstract_en END,metadata_source='usenix_official',abstract_source=CASE WHEN excluded.abstract_en<>'' THEN 'usenix_official' ELSE papers.abstract_source END,metadata_updated_at=excluded.metadata_updated_at,abstract_fetched_at=CASE WHEN excluded.abstract_en<>'' THEN excluded.abstract_fetched_at ELSE papers.abstract_fetched_at END,abstract_status=CASE WHEN excluded.abstract_en<>'' THEN 'success' ELSE papers.abstract_status END,official_url=excluded.official_url,collection_source=excluded.collection_source,collected_at=excluded.collected_at"
+          (sql_quote id) doi (sql_quote title) (sql_quote authors) (sql_quote year) (sql_quote abstract)
+          stamp stamp (sql_quote (if abstract = "" then "not_found" else "success"))
+          (sql_quote official_url) (sql_quote url) stamp);
+        if Sqlite3.changes db > 0 then incr inserted;
+        exec db (Printf.sprintf "INSERT OR IGNORE INTO reviews(paper_id) VALUES(%s)" (sql_quote id))
+      ) papers;
+      Printf.printf "OSDI %s collection: %d candidate paper(s) parsed; %d row(s) inserted or updated.\n" year (List.length papers) !inserted;
+      if papers = [] then failwith "No paper records parsed; database was not changed."
+
 let status_label p =
   match p.reviewed, p.decision with
   | false, Undecided -> "UNREAD"
@@ -556,6 +653,9 @@ let main () =
     );
     if command = "--fetch-abstracts" then (
       fetch_abstracts db; ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--collect" && Array.length Sys.argv > 3 && String.uppercase_ascii Sys.argv.(2) = "OSDI" then (
+      collect_osdi db Sys.argv.(3); ignore (Sqlite3.db_close db); exit 0
     );
     let tsv_path = if command <> "" && command.[0] <> '-' then command else "papers.tsv" in
     ensure_seed_data db tsv_path;

@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS papers (
   abstract_fetched_at TEXT,
   abstract_status TEXT NOT NULL DEFAULT 'pending',
   abstract_error TEXT,
+  official_url TEXT,
+  collection_source TEXT,
+  collected_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
