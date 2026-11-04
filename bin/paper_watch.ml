@@ -472,15 +472,19 @@ let parse_usenix_papers html =
         try ignore (Str.search_forward (Str.regexp_string "/presentation/") href 0); true
         with Not_found -> false
       in
-      let acc = if title <> "" && is_presentation then (heading_start,body_start,title,href)::acc else acc in
+      let is_non_paper_presentation =
+        let path = String.lowercase_ascii href |> fun p -> List.hd (String.split_on_char '?' p) in
+        Filename.basename path = "keynote"
+      in
+      let acc = if title <> "" && is_presentation then (heading_start,body_start,title,href,not is_non_paper_presentation)::acc else acc in
       headings body_start acc
     with Not_found -> List.rev acc
   in
   let hs = headings 0 [] in
   let rec make = function
     | [] -> []
-    | (_,body_start,title,href)::rest ->
-        let body_end = match rest with (next_heading,_,_,_)::_ -> next_heading | [] -> String.length html in
+    | (_,body_start,title,href,is_paper)::rest ->
+        let body_end = match rest with (next_heading,_,_,_,_)::_ -> next_heading | [] -> String.length html in
         let body = String.sub html body_start (max 0 (body_end-body_start)) |> strip_html in
         let available = Str.regexp_case_fold "Available Media" in
         let authors =
@@ -499,7 +503,8 @@ let parse_usenix_papers html =
           with Not_found -> ""
         in
         let absolute = if String.length href > 0 && href.[0] = '/' then "https://www.usenix.org" ^ href else href in
-        (title, authors, abstract, absolute) :: make rest
+        let current = if is_paper then [(title, authors, abstract, absolute)] else [] in
+        current @ make rest
   in
   make hs
 
@@ -536,6 +541,73 @@ let collect_osdi db year =
       ) papers;
       Printf.printf "OSDI %s collection: %d candidate paper(s) parsed; %d row(s) inserted or updated.\n" year (List.length papers) !inserted;
       if papers = [] then failwith "No paper records parsed; database was not changed."
+
+let normalize_title s =
+  let s = String.lowercase_ascii s in
+  let b = Buffer.create (String.length s) in
+  let pending_space = ref false in
+  String.iter (fun c ->
+    if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') then (
+      if !pending_space && Buffer.length b > 0 then Buffer.add_char b ' ';
+      pending_space := false;
+      Buffer.add_char b c
+    ) else pending_space := true
+  ) s;
+  Buffer.contents b
+
+let query_osdi_official_rows db year =
+  let stmt = Sqlite3.prepare db
+    "SELECT title, COALESCE(official_url,''), COALESCE(abstract_en,''), COALESCE(doi,'') \
+     FROM papers WHERE conference='OSDI' AND year=?1 ORDER BY title" in
+  ignore (Sqlite3.bind stmt 1 (Sqlite3.Data.TEXT year));
+  let rec loop acc = match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW ->
+        let title = text_column stmt 0 in
+        let url = text_column stmt 1 in
+        let abstract = text_column stmt 2 in
+        let doi = text_column stmt 3 in
+        let is_official = String.length url > 0 &&
+          (try ignore (Str.search_forward (Str.regexp_string "/presentation/") url 0); true with Not_found -> false) in
+        loop (if is_official then (title,url,abstract,doi)::acc else acc)
+    | Sqlite3.Rc.DONE -> List.rev acc
+    | rc -> check_rc "Verifying OSDI rows" rc; List.rev acc
+  in
+  let rows = loop [] in
+  ignore (Sqlite3.finalize stmt);
+  rows
+
+let verify_osdi db year =
+  let short_year = if String.length year >= 2 then String.sub year (String.length year-2) 2 else year in
+  let source_url = "https://www.usenix.org/conference/osdi" ^ short_year ^ "/technical-sessions" in
+  Printf.printf "Fetching official proceedings for verification: %s\n%!" source_url;
+  match http_get_html source_url with
+  | None -> failwith ("Could not fetch official USENIX page: " ^ source_url)
+  | Some html ->
+      let official = parse_usenix_papers html in
+      let db_rows = query_osdi_official_rows db year in
+      let official_by_title = Hashtbl.create 160 in
+      let db_by_title = Hashtbl.create 160 in
+      List.iter (fun (title,_,_,_) -> Hashtbl.replace official_by_title (normalize_title title) title) official;
+      List.iter (fun (title,_,_,_) -> Hashtbl.replace db_by_title (normalize_title title) title) db_rows;
+      let missing = Hashtbl.fold (fun key title acc ->
+        if Hashtbl.mem db_by_title key then acc else title::acc) official_by_title [] |> List.sort String.compare in
+      let extra = Hashtbl.fold (fun key title acc ->
+        if Hashtbl.mem official_by_title key then acc else title::acc) db_by_title [] |> List.sort String.compare in
+      let matched_db_rows = List.filter (fun (title,_,_,_) -> Hashtbl.mem official_by_title (normalize_title title)) db_rows in
+      let missing_abstracts = List.filter (fun (_,_,abstract,_) -> String.trim abstract = "") matched_db_rows in
+      let missing_dois = List.filter (fun (_,_,_,doi) -> String.trim doi = "") matched_db_rows in
+      Printf.printf "\nOSDI %s verification\n" year;
+      Printf.printf "Official paper candidates (keynote excluded): %d\n" (List.length official);
+      Printf.printf "Database official-page records: %d\n" (List.length db_rows);
+      Printf.printf "Missing from database: %d\n" (List.length missing);
+      List.iter (fun t -> Printf.printf "  MISSING: %s\n" t) missing;
+      Printf.printf "Not in official paper list: %d\n" (List.length extra);
+      List.iter (fun t -> Printf.printf "  EXTRA: %s\n" t) extra;
+      Printf.printf "Matched paper records with empty abstract: %d\n" (List.length missing_abstracts);
+      List.iter (fun (t,_,_,_) -> Printf.printf "  NO ABSTRACT: %s\n" t) missing_abstracts;
+      Printf.printf "Matched paper records without DOI: %d\n" (List.length missing_dois);
+      if missing = [] && extra = [] then print_endline "TITLE SET: MATCH"
+      else print_endline "TITLE SET: MISMATCH"
 
 let status_label p =
   match p.reviewed, p.decision with
@@ -658,6 +730,9 @@ let main () =
     );
     if command = "--fetch-abstracts" then (
       fetch_abstracts db; ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--verify" && Array.length Sys.argv > 3 && String.uppercase_ascii Sys.argv.(2) = "OSDI" then (
+      verify_osdi db Sys.argv.(3); ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--collect" && Array.length Sys.argv > 3 && String.uppercase_ascii Sys.argv.(2) = "OSDI" then (
       collect_osdi db Sys.argv.(3); ignore (Sqlite3.db_close db); exit 0
