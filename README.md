@@ -274,8 +274,10 @@ batches or long-term use, configure DeepL or an OpenAI-compatible API. Request
 failures fall through to the next backend in the chain.
 
 Translations are stored in `abstract_ja`, `abstract_ja_source`, and
-`abstract_ja_at`. The TUI wraps Japanese text by display width so wide
-characters are not split or counted as single columns.
+`abstract_ja_at`. Line breaks and indentation in the English abstract are
+collapsed before translation so the backend receives one continuous paragraph;
+the TUI then wraps the Japanese text by display width so wide characters are
+not counted as single columns.
 
 ## TUI keys
 

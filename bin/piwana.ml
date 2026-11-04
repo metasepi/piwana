@@ -1001,8 +1001,16 @@ let translate_with backend text =
      | Some _ -> ());
     result
 
+(* Abstracts collected from publisher metadata often contain hard line breaks
+   and indentation.  Translators otherwise treat each line as a separate
+   segment, which produces Japanese sentences split at arbitrary points.
+   Collapse every whitespace run so the backend sees one continuous text. *)
+let normalize_translation_input text =
+  Str.global_replace (Str.regexp "[ \t\r\n]+") " " text |> String.trim
+
 let translate_abstract text =
-  if String.trim text = "" then None
+  let text = normalize_translation_input text in
+  if text = "" then None
   else
     let rec loop = function
       | [] -> None
