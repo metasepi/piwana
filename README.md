@@ -22,10 +22,12 @@ dune exec ./bin/piwana.exe
 The database defaults to `~/.local/state/piwana/papers.sqlite3`.
 Set `PIWANA_DB` to use another database path.
 
-On first run, `papers.tsv` is imported if the database is empty. The bundled
-TSV contains **fictional UI sample records** with placeholder DOIs
-(`10.0000/...`); they are not real papers and cannot be used to test metadata
-retrieval.
+The database starts empty. Populate it with the collectors described below,
+for example:
+
+```sh
+dune exec ./bin/piwana.exe -- --sync all 2026
+```
 
 ## Import individual DOIs
 
@@ -33,7 +35,7 @@ Create a text file with one DOI per line. A `https://doi.org/` URL is also
 accepted. Blank lines and lines beginning with `#` are ignored.
 
 ```sh
-dune exec ./bin/piwana.exe -- --import-dois dois.txt
+dune exec ./bin/piwana.exe -- --import-dois path/to/dois.txt
 dune exec ./bin/piwana.exe -- --fetch-abstracts
 ```
 

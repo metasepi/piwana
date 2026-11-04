@@ -1627,10 +1627,12 @@ let main () =
       collect_by_conference db (String.uppercase_ascii Sys.argv.(2)) Sys.argv.(3);
       ignore (Sqlite3.db_close db); exit 0
     );
-    let tsv_path = if command <> "" && command.[0] <> '-' then command else "papers.tsv" in
-    ensure_seed_data db tsv_path;
+    let tsv_path = if command <> "" && command.[0] <> '-' then Some command else None in
+    (match tsv_path with Some path -> ensure_seed_data db path | None -> ());
     let papers = load_papers db in
-    if papers = [] then (prerr_endline "No papers in database. Provide a TSV file on first run."; ignore (Sqlite3.db_close db); exit 0);
+    if papers = [] then (
+      prerr_endline "No papers in database. Run --sync all YEAR (for example: --sync all 2026) to collect papers.";
+      ignore (Sqlite3.db_close db); exit 0);
     let old_term = terminal_raw_mode () in
     let selected = ref 0 and show_japanese = ref false and abstract_scroll = ref 0 and running = ref true in
     let finish () = restore_terminal old_term; clear_screen (); print_endline "piwana: SQLite state saved." in
