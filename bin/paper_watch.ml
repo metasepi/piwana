@@ -9,6 +9,7 @@ type paper = {
   year : string;
   abstract_en : string;
   abstract_ja : string;
+  abstract_source : string;
   mutable reviewed : bool;
   mutable decision : decision;
 }
@@ -167,18 +168,19 @@ let text_column stmt i =
 
 let load_papers db =
   let stmt = Sqlite3.prepare db
-    "SELECT p.id,COALESCE(p.doi,''),p.title,p.authors,p.conference,p.year,p.abstract_en,p.abstract_ja, \
+    "SELECT p.id,COALESCE(p.doi,''),p.title,p.authors,p.conference,p.year,p.abstract_en,p.abstract_ja,COALESCE(p.abstract_source,''), \
      CASE WHEN r.reviewed_at IS NULL THEN 0 ELSE 1 END,r.decision \
      FROM papers p LEFT JOIN reviews r ON r.paper_id=p.id \
      ORDER BY p.conference,p.year DESC,p.title" in
   let rec loop acc = match Sqlite3.step stmt with
     | Sqlite3.Rc.ROW ->
-        let reviewed = Sqlite3.column_int stmt 8 <> 0 in
+        let reviewed = Sqlite3.column_int stmt 9 <> 0 in
         let p = {
           id=text_column stmt 0; doi=text_column stmt 1; title=text_column stmt 2;
           authors=text_column stmt 3; conference=text_column stmt 4; year=text_column stmt 5;
           abstract_en=text_column stmt 6; abstract_ja=text_column stmt 7;
-          reviewed; decision=decision_of_string (text_column stmt 9)
+          abstract_source=text_column stmt 8;
+          reviewed; decision=decision_of_string (text_column stmt 10)
         } in loop (p :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
     | rc -> check_rc "Loading papers" rc; List.rev acc
@@ -444,6 +446,39 @@ let truncate width s =
   if width <= 3 || String.length s <= width then s
   else String.sub s 0 (width - 3) ^ "..."
 
+let terminal_size () =
+  try
+    let ic = Unix.open_process_in "stty size 2>/dev/null" in
+    let line = input_line ic in
+    ignore (Unix.close_process_in ic);
+    match String.split_on_char ' ' (String.trim line) |> List.filter ((<>) "") with
+    | [rows; cols] -> (max 24 (int_of_string cols), max 10 (int_of_string rows))
+    | _ -> (80, 24)
+  with _ -> (80, 24)
+
+let wrap_text width text =
+  let width = max 10 width in
+  let wrap_paragraph paragraph =
+    let words = String.split_on_char ' ' (String.trim paragraph) |> List.filter ((<>) "") in
+    let rec loop current_len current acc = function
+      | [] -> List.rev (if current = "" then acc else current :: acc)
+      | word :: rest ->
+          if String.length word > width then
+            let head = String.sub word 0 width in
+            let tail = String.sub word width (String.length word - width) in
+            if current = "" then loop width head acc (tail :: rest)
+            else loop 0 "" (current :: acc) (word :: rest)
+          else if current = "" then loop (String.length word) word acc rest
+          else if current_len + 1 + String.length word <= width then
+            loop (current_len + 1 + String.length word) (current ^ " " ^ word) acc rest
+          else loop (String.length word) word (current :: acc) rest
+    in
+    loop 0 "" [] words
+  in
+  String.split_on_char '\n' text
+  |> List.concat_map (fun paragraph ->
+       if String.trim paragraph = "" then [""] else wrap_paragraph paragraph)
+
 let clear_screen () = print_string "\027[2J\027[H"
 
 let terminal_raw_mode () =
@@ -463,33 +498,48 @@ let read_key () =
   let n = Unix.read Unix.stdin b 0 1 in
   if n = 0 then 'q' else Bytes.get b 0
 
-let render papers selected show_japanese =
+let render papers selected show_japanese abstract_scroll =
   clear_screen ();
+  let width, height = terminal_size () in
   let count = List.length papers in
   let keeps = List.fold_left (fun n p -> if p.decision = Keep then n + 1 else n) 0 papers in
   let unread = List.fold_left (fun n p -> if not p.reviewed && p.decision = Undecided then n + 1 else n) 0 papers in
   Printf.printf " PAPER-WATCH  |  %d papers  |  %d unread  |  %d keep\n" count unread keeps;
-  print_endline " -------------------------------------------------------------------------------";
-  print_endline " j/k: move   r: read   s: keep   x: skip   u: reset   t: translation   q: quit";
-  print_endline " -------------------------------------------------------------------------------";
-  List.iteri (fun i p ->
+  print_endline (String.make (min width 100) '-');
+  print_endline " j/k: paper  r: read  s: keep  x: skip  u: reset  t: translation  [/]: abstract page  q: quit";
+  print_endline (String.make (min width 100) '-');
+  let list_rows = max 3 (min 8 (height / 3)) in
+  let first = max 0 (min (max 0 (count - list_rows)) (selected - list_rows / 2)) in
+  let last = min count (first + list_rows) in
+  for i = first to last - 1 do
+    let p = List.nth papers i in
     let marker = if i = selected then ">" else " " in
-    let line = Printf.sprintf "%s [%5s] %-10s %s (%s)" marker (string_of_int (i + 1)) (status_label p) p.title p.conference in
-    print_endline (truncate 100 line)
-  ) papers;
-  print_endline " -------------------------------------------------------------------------------";
+    let line = Printf.sprintf "%s [%5d] %-10s %s (%s)" marker (i + 1) (status_label p) p.title p.conference in
+    print_endline (truncate width line)
+  done;
+  if count > list_rows then Printf.printf " Papers %d-%d of %d\n" (first + 1) last count;
+  print_endline (String.make (min width 100) '-');
   match List.nth_opt papers selected with
   | None -> print_endline "No papers loaded."
   | Some p ->
       Printf.printf "%s — %s\n" p.conference p.year;
-      Printf.printf "ID: %s\n" p.id;
-      if p.doi <> "" then Printf.printf "DOI: %s\n" p.doi;
-      Printf.printf "Authors: %s\n\n" p.authors;
-      print_endline "ABSTRACT"; print_endline "--------";
+      Printf.printf "DOI: %s\n" (if p.doi = "" then "(none)" else p.doi);
+      Printf.printf "Authors: %s\n" (truncate width p.authors);
+      Printf.printf "Abstract source: %s\n" (if p.abstract_source = "" then "not available" else p.abstract_source);
+      print_endline "ABSTRACT";
+      print_endline "--------";
       let abstract = if show_japanese && p.abstract_ja <> "" then p.abstract_ja else p.abstract_en in
-      List.iter print_endline (String.split_on_char '\n' abstract);
-      if show_japanese && p.abstract_ja = "" then print_endline "\n[No Japanese translation available.]";
-      print_endline ""; Printf.printf "Current state: %s\n" (status_label p); flush stdout
+      let abstract = if abstract = "" then "[No abstract available.]" else abstract in
+      let lines = wrap_text (width - 2) abstract in
+      let reserved = 13 + (last - first) + (if count > list_rows then 1 else 0) in
+      let visible = max 4 (height - reserved) in
+      let max_scroll = max 0 (List.length lines - visible) in
+      let scroll = min abstract_scroll max_scroll in
+      List.iter print_endline (List.filteri (fun i _ -> i >= scroll && i < scroll + visible) lines);
+      if max_scroll > 0 then Printf.printf "\nAbstract lines %d-%d of %d\n" (scroll + 1) (min (scroll + visible) (List.length lines)) (List.length lines);
+      if show_japanese && p.abstract_ja = "" then print_endline "[No Japanese translation available.]";
+      Printf.printf "\nCurrent state: %s\n" (status_label p);
+      flush stdout
 
 let set_state db p reviewed decision =
   p.reviewed <- reviewed; p.decision <- decision; save_state db p
@@ -512,21 +562,25 @@ let main () =
     let papers = load_papers db in
     if papers = [] then (prerr_endline "No papers in database. Provide a TSV file on first run."; ignore (Sqlite3.db_close db); exit 0);
     let old_term = terminal_raw_mode () in
-    let selected = ref 0 and show_japanese = ref false and running = ref true in
+    let selected = ref 0 and show_japanese = ref false and abstract_scroll = ref 0 and running = ref true in
     let finish () = restore_terminal old_term; clear_screen (); print_endline "paper-watch: SQLite state saved." in
     (try
       while !running do
-        render papers !selected !show_japanese;
+        render papers !selected !show_japanese !abstract_scroll;
         let key = read_key () in
         let p = List.nth papers !selected in
         (match key with
-         | 'j' -> selected := min (List.length papers - 1) (!selected + 1)
-         | 'k' -> selected := max 0 (!selected - 1)
+         | 'j' -> selected := min (List.length papers - 1) (!selected + 1); abstract_scroll := 0
+         | 'k' -> selected := max 0 (!selected - 1); abstract_scroll := 0
          | 'r' -> set_state db p true Undecided
          | 's' -> set_state db p true Keep
          | 'x' -> set_state db p true Skip
          | 'u' -> set_state db p false Undecided
-         | 't' -> show_japanese := not !show_japanese
+         | 't' -> show_japanese := not !show_japanese; abstract_scroll := 0
+         | ']' | ' ' -> abstract_scroll := !abstract_scroll + max 1 (snd (terminal_size ()) / 2)
+         | '[' -> abstract_scroll := max 0 (!abstract_scroll - max 1 (snd (terminal_size ()) / 2))
+         | 'g' -> abstract_scroll := 0
+         | 'G' -> abstract_scroll := 1000000
          | 'q' -> running := false
          | _ -> ())
       done;

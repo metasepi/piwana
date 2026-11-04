@@ -61,7 +61,12 @@ The fetch command only retries records with an empty abstract and status `pendin
 - `x`: Skip
 - `u`: reset to unread
 - `t`: toggle English / Japanese abstract
+- `]` or `Space`: scroll the abstract down by half a screen
+- `[`: scroll the abstract up by half a screen
+- `g` / `G`: jump to the beginning / end of the abstract
 - `q`: quit
+
+The selected paper detail pane wraps the abstract to the terminal width, shows its retrieval source, and pages long abstracts vertically. The paper list is limited to a viewport around the selected row so it does not push the abstract off-screen.
 
 ## Scope and limitations
 
