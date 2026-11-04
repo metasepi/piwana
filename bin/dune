@@ -1,0 +1,3 @@
+(executable
+ (name paper_watch)
+ (libraries unix sqlite3))
