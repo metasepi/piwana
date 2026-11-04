@@ -176,10 +176,34 @@ dune exec ./bin/piwana.exe -- --fetch-abstracts
 dune exec ./bin/piwana.exe -- --fetch-abstracts SOSP 2026
 ```
 
-The fetcher tries Crossref first, then Semantic Scholar, OpenAlex, and (for ACM
-DOI pages) the ACM Digital Library HTML metadata. OpenAlex abstracts are
-reconstructed from `abstract_inverted_index`. Retrieval stops at the first
-non-empty abstract. It does not download PDFs.
+The fetcher tries these sources in order until it finds a non-empty abstract:
+
+1. Crossref DOI metadata
+2. OpenAlex DOI metadata
+3. OpenAlex exact-title search (preprint/arXiv record)
+4. arXiv exact-title search
+5. Semantic Scholar DOI metadata
+6. ACM Digital Library HTML metadata
+
+OpenAlex abstracts are reconstructed from `abstract_inverted_index`. The
+OpenAlex and arXiv title fallbacks accept only an exact normalized title match;
+they do not use fuzzy matching. The successful source is recorded in
+`abstract_source` (for example `arxiv`, `openalex_title`, or
+`semantic_scholar`). Semantic Scholar requests are retried when the API returns
+HTTP 429 or a server error. If you have a Semantic Scholar API key, export it to
+reduce rate limiting:
+
+```sh
+export SEMANTIC_SCHOLAR_API_KEY=your-key
+# or: export S2_API_KEY=your-key
+```
+
+Retrieval stops at the first non-empty abstract and does not download PDFs.
+
+Accessible author pages or publisher pages found by a general web search may
+still have an abstract that these sources lack. Such manual retrieval is not
+automatic; add the text to `abstract_en` in SQLite if you need it. The bundled
+collectors intentionally avoid scraping arbitrary search-engine results.
 
 The `papers` table records `abstract_source`, `abstract_fetched_at`, and
 `abstract_status` (`pending`, `success`, or `not_found`). Records without an

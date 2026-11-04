@@ -173,6 +173,10 @@ let text_column stmt i =
   | Sqlite3.Data.FLOAT f -> string_of_float f
   | Sqlite3.Data.NULL | Sqlite3.Data.BLOB _ | Sqlite3.Data.NONE -> ""
 
+let starts_with s prefix =
+  String.length s >= String.length prefix &&
+  String.sub s 0 (String.length prefix) = prefix
+
 let load_papers db =
   let stmt = Sqlite3.prepare db
     "SELECT p.id,COALESCE(p.doi,''),p.title,p.authors,p.conference,p.year,p.abstract_en,p.abstract_ja,COALESCE(p.abstract_source,''), \
@@ -213,17 +217,33 @@ let percent_encode_path s =
     | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
   Buffer.contents b
 
-let http_get_with_headers headers url =
+let http_get_with_headers_status headers url =
   let header_args = String.concat " " (List.map (fun h -> "-H " ^ shell_quote h) headers) in
-  let command = "curl -fsSL --connect-timeout 8 --max-time 25 " ^ header_args ^ " " ^ shell_quote url ^ " 2>/dev/null" in
+  let command =
+    "curl -sSL --connect-timeout 8 --max-time 30 " ^ header_args ^
+    " -w '%{http_code}' " ^ shell_quote url ^ " 2>/dev/null" in
   let ic = Unix.open_process_in command in
   let contents =
     let b = Buffer.create 4096 in
     (try while true do Buffer.add_string b (input_line ic); Buffer.add_char b '\n' done with End_of_file -> ());
-    Buffer.contents b
+    String.trim (Buffer.contents b)
   in
-  match Unix.close_process_in ic with
-  | Unix.WEXITED 0 -> Some contents
+  let exited_ok = match Unix.close_process_in ic with Unix.WEXITED 0 -> true | _ -> false in
+  if not exited_ok then (0, "")
+  else
+    let len = String.length contents in
+    let status =
+      if len >= 3 then
+        match int_of_string_opt (String.sub contents (len - 3) 3) with
+        | Some code -> code
+        | None -> 0
+      else 0 in
+    let body = if len >= 3 then String.sub contents 0 (len - 3) else contents in
+    (status, body)
+
+let http_get_with_headers headers url =
+  match http_get_with_headers_status headers url with
+  | status, body when status >= 200 && status < 300 -> Some body
   | _ -> None
 
 let http_get url = http_get_with_headers ["Accept: application/json"; "User-Agent: piwana/0.1 (academic literature review)"] url
@@ -267,6 +287,25 @@ let html_to_text s =
   let s = List.fold_left (fun acc (a,b) -> replace_all acc a b) s replacements in
   String.trim s
 
+let title_key s =
+  let s = String.lowercase_ascii s in
+  let b = Buffer.create (String.length s) in
+  String.iter (fun c ->
+    if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') then
+      Buffer.add_char b c) s;
+  Buffer.contents b
+
+let collapse_whitespace s =
+  let b = Buffer.create (String.length s) in
+  let pending_space = ref false in
+  String.iter (fun c ->
+    if c = ' ' || c = '\t' || c = '\n' || c = '\r' then pending_space := true
+    else (
+      if !pending_space && Buffer.length b > 0 then Buffer.add_char b ' ';
+      pending_space := false;
+      Buffer.add_char b c)) s;
+  String.trim (Buffer.contents b)
+
 let strip_abstract_label s =
   let s = String.trim s in
   let label = "abstract" in
@@ -307,23 +346,59 @@ let crossref_record doi =
         Some (abstract, title, authors, year)
        with _ -> None)
 
+let semantic_scholar_api_key () =
+  let nonempty = function
+    | Some value ->
+        let value = String.trim value in
+        if value = "" then None else Some value
+    | None -> None in
+  match nonempty (Sys.getenv_opt "SEMANTIC_SCHOLAR_API_KEY") with
+  | Some key -> Some key
+  | None -> nonempty (Sys.getenv_opt "S2_API_KEY")
+
+let semantic_scholar_headers () =
+  ["Accept: application/json"; "User-Agent: piwana/0.1 (academic literature review)"] @
+  (match semantic_scholar_api_key () with
+   | Some key -> ["x-api-key: " ^ key]
+   | None -> [])
+
+let parse_semantic_scholar_record body =
+  try
+    let obj = Yojson.Basic.from_string body in
+    let abstract = json_string (json_field "abstract" obj) in
+    let title = json_string (json_field "title" obj) in
+    let authors = match json_field "authors" obj with
+      | `List xs -> String.concat ", " (List.filter ((<>) "") (List.map (fun a -> json_string (json_field "name" a)) xs))
+      | _ -> "" in
+    let year = json_string (json_field "year" obj) in
+    Some (abstract, title, authors, year)
+  with _ -> None
+
 let semantic_scholar_record doi =
   let paper_id = "DOI:" ^ doi in
   let url = "https://api.semanticscholar.org/graph/v1/paper/" ^
     percent_encode_path paper_id ^ "?fields=title,abstract,authors,year" in
-  match http_get url with
-  | None -> None
-  | Some body ->
-      (try
-        let obj = Yojson.Basic.from_string body in
-        let abstract = json_string (json_field "abstract" obj) in
-        let title = json_string (json_field "title" obj) in
-        let authors = match json_field "authors" obj with
-          | `List xs -> String.concat ", " (List.filter ((<>) "") (List.map (fun a -> json_string (json_field "name" a)) xs))
-          | _ -> "" in
-        let year = json_string (json_field "year" obj) in
-        Some (abstract, title, authors, year)
-       with _ -> None)
+  let rec attempt tries =
+    match http_get_with_headers_status (semantic_scholar_headers ()) url with
+    | 200, body -> parse_semantic_scholar_record body
+    | status, _ when (status = 429 || status >= 500) && tries > 0 ->
+        let delay = match tries with 4 -> 3.0 | 3 -> 5.0 | 2 -> 8.0 | _ -> 12.0 in
+        Unix.sleepf delay;
+        attempt (tries - 1)
+    | _ -> None
+  in
+  attempt 4
+
+let openalex_abstract_of_item item =
+  match json_field "abstract_inverted_index" item with
+  | `Assoc entries ->
+      let words = List.concat (List.map (fun (word, positions) ->
+        match positions with
+        | `List ps -> List.filter_map (function `Int n -> Some (n, word) | _ -> None) ps
+        | _ -> []) entries) in
+      words |> List.sort (fun (a,_) (b,_) -> compare a b)
+      |> List.map snd |> String.concat " "
+  | _ -> ""
 
 let openalex_record doi =
   let url = "https://api.openalex.org/works/https://doi.org/" ^ percent_encode_path doi in
@@ -332,19 +407,79 @@ let openalex_record doi =
   | Some body ->
       (try
         let obj = Yojson.Basic.from_string body in
-        let inverted = json_field "abstract_inverted_index" obj in
-        let words = match inverted with
-          | `Assoc entries ->
-              List.concat (List.map (fun (word, positions) -> match positions with
-                | `List ps -> List.filter_map (function `Int n -> Some (n, word) | _ -> None) ps
-                | _ -> []) entries)
-          | _ -> [] in
-        let abstract = words |> List.sort (fun (a,_) (b,_) -> compare a b)
-          |> List.map snd |> String.concat " " in
+        let abstract = openalex_abstract_of_item obj in
         let title = json_string (json_field "title" obj) in
         let year = json_string (json_field "publication_year" obj) in
         Some (abstract, title, "", year)
        with _ -> None)
+
+let openalex_title_record title =
+  let url = "https://api.openalex.org/works?search=" ^ percent_encode_path title ^
+    "&per-page=50&select=title,abstract_inverted_index,doi,publication_year" in
+  match http_get url with
+  | None -> None
+  | Some body ->
+      (try
+        let root = Yojson.Basic.from_string body in
+        let items = match json_field "results" root with `List xs -> xs | _ -> [] in
+        let wanted = title_key title in
+        let candidates = List.filter_map (fun item ->
+          let item_title = json_string (json_field "title" item) in
+          let abstract = openalex_abstract_of_item item in
+          if abstract = "" || title_key item_title <> wanted then None
+          else
+            let doi = json_string (json_field "doi" item) in
+            let preprint = starts_with doi "https://doi.org/10.48550/arxiv." in
+            let score = (if preprint then 2 else 0) +
+              (if String.length abstract >= 500 then 1 else 0) in
+            Some (score, String.length abstract, abstract, item_title,
+                  json_string (json_field "publication_year" item))) items in
+        match List.sort (fun (s1,l1,_,_,_) (s2,l2,_,_,_) ->
+          compare (s2,l2) (s1,l1)) candidates with
+        | (_, _, abstract, t, y) :: _ -> Some (abstract, t, "", y)
+        | [] -> None
+       with _ -> None)
+
+let parse_arxiv_entries xml =
+  let start_re = Str.regexp "<entry>" in
+  let end_re = Str.regexp "</entry>" in
+  let rec loop pos acc =
+    try
+      ignore (Str.search_forward start_re xml pos);
+      let start = Str.match_end () in
+      ignore (Str.search_forward end_re xml start);
+      let stop = Str.match_beginning () in
+      let block = String.sub xml start (stop - start) in
+      loop (Str.match_end ()) (block :: acc)
+    with Not_found -> List.rev acc
+  in
+  loop 0 []
+
+let xml_tag tag block =
+  let re = Str.regexp ("<" ^ tag ^ ">\\([^<]*\\)</" ^ tag ^ ">") in
+  try
+    ignore (Str.search_forward re block 0);
+    html_to_text (Str.matched_group 1 block)
+  with Not_found -> ""
+
+let arxiv_record title =
+  let query = "ti:\"" ^ title ^ "\"" in
+  let url = "https://export.arxiv.org/api/query?search_query=" ^
+    percent_encode_path query ^ "&max_results=10" in
+  match http_get_with_headers
+    ["Accept: application/atom+xml";
+     "User-Agent: piwana/0.1 (academic literature review)"] url with
+  | None -> None
+  | Some xml ->
+      let wanted = title_key title in
+      let candidates = parse_arxiv_entries xml |> List.filter_map (fun block ->
+        let item_title = xml_tag "title" block in
+        let abstract = xml_tag "summary" block |> collapse_whitespace in
+        if abstract = "" || title_key item_title <> wanted then None
+        else Some (abstract, item_title)) in
+      (match candidates with
+       | (abstract, t) :: _ -> Some (abstract, t, "", "")
+       | [] -> None)
 
 let html_attribute tag attr =
   let lower = String.lowercase_ascii tag in
@@ -405,23 +540,25 @@ let fetch_abstracts ?(conference="") ?(year="") db =
   let filters = if year = "" then filters else filters @ ["year=" ^ sql_quote year] in
   let where = String.concat " AND " filters in
   let stmt = Sqlite3.prepare db
-    ("SELECT id,doi FROM papers WHERE " ^ where ^ " ORDER BY conference,year,title") in
+    ("SELECT id,doi,title FROM papers WHERE " ^ where ^ " ORDER BY conference,year,title") in
   let rec collect acc = match Sqlite3.step stmt with
-    | Sqlite3.Rc.ROW -> collect ((text_column stmt 0, text_column stmt 1) :: acc)
+    | Sqlite3.Rc.ROW -> collect ((text_column stmt 0, text_column stmt 1, text_column stmt 2) :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
     | rc -> check_rc "Selecting papers to fetch" rc; List.rev acc
   in
   let rows = collect [] in
   ignore (Sqlite3.finalize stmt);
   let ok = ref 0 and missing = ref 0 in
-  List.iter (fun (id, doi) ->
+  List.iter (fun (id, doi, paper_title) ->
     Printf.printf "Fetching %s ... %!" doi;
     let crossref = crossref_record doi in
     let result =
       let candidates = [
         ("crossref", (fun () -> crossref));
-        ("semantic_scholar", (fun () -> semantic_scholar_record doi));
         ("openalex", (fun () -> openalex_record doi));
+        ("openalex_title", (fun () -> openalex_title_record paper_title));
+        ("arxiv", (fun () -> arxiv_record paper_title));
+        ("semantic_scholar", (fun () -> semantic_scholar_record doi));
         ("acm", (fun () -> acm_record doi))
       ] in
       let rec choose = function
@@ -444,7 +581,7 @@ let fetch_abstracts ?(conference="") ?(year="") db =
         update_paper_metadata db id source abstract title authors year;
         incr ok; Printf.printf " %s (%d chars)\n%!" source (String.length abstract)
     | None ->
-        exec db (Printf.sprintf "UPDATE papers SET abstract_status='not_found',abstract_fetched_at=%s,abstract_error='No abstract returned by Crossref, Semantic Scholar, OpenAlex, or ACM' WHERE id=%s"
+        exec db (Printf.sprintf "UPDATE papers SET abstract_status='not_found',abstract_fetched_at=%s,abstract_error='No abstract returned by Crossref, OpenAlex, arXiv, Semantic Scholar, or ACM' WHERE id=%s"
           (sql_quote (now_iso ())) (sql_quote id));
         incr missing; print_endline " not found"
   ) rows;
@@ -596,10 +733,6 @@ let percent_encode_component s =
 (* ------------------------------------------------------------------ *)
 (* DOI policy and proceedings collectors                               *)
 (* ------------------------------------------------------------------ *)
-
-let starts_with s prefix =
-  String.length s >= String.length prefix &&
-  String.sub s 0 (String.length prefix) = prefix
 
 let unique_strings xs =
   let seen = Hashtbl.create 16 in
