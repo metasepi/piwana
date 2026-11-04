@@ -1,3 +1,3 @@
 (executable
- (name paper_watch)
+ (name piwana)
  (libraries unix sqlite3 yojson str))

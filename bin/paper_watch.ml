@@ -49,14 +49,14 @@ let rec mkdir_p path =
 let home_dir () = match Sys.getenv_opt "HOME" with Some h -> h | None -> "."
 
 let default_db_path () =
-  match Sys.getenv_opt "PAPER_WATCH_DB" with
+  match Sys.getenv_opt "PIWANA_DB" with
   | Some p -> p
-  | None -> Filename.concat (home_dir ()) ".local/state/paper-watch/papers.sqlite3"
+  | None -> Filename.concat (home_dir ()) ".local/state/piwana/papers.sqlite3"
 
 let legacy_state_path () =
-  match Sys.getenv_opt "PAPER_WATCH_STATE" with
+  match Sys.getenv_opt "PIWANA_STATE" with
   | Some p -> p
-  | None -> Filename.concat (home_dir ()) ".local/state/paper-watch/reviews.tsv"
+  | None -> Filename.concat (home_dir ()) ".local/state/piwana/reviews.tsv"
 
 let init_schema db =
   exec db "PRAGMA foreign_keys = ON";
@@ -223,7 +223,7 @@ let http_get_with_headers headers url =
   | Unix.WEXITED 0 -> Some contents
   | _ -> None
 
-let http_get url = http_get_with_headers ["Accept: application/json"; "User-Agent: paper-watch/0.1 (academic literature review)"] url
+let http_get url = http_get_with_headers ["Accept: application/json"; "User-Agent: piwana/0.1 (academic literature review)"] url
 let http_get_html url = http_get_with_headers ["Accept: text/html,application/xhtml+xml"; "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"] url
 
 let json_field key = function
@@ -766,7 +766,7 @@ let render papers selected show_japanese abstract_scroll =
   let count = List.length papers in
   let keeps = List.fold_left (fun n p -> if p.decision = Keep then n + 1 else n) 0 papers in
   let unread = List.fold_left (fun n p -> if not p.reviewed && p.decision = Undecided then n + 1 else n) 0 papers in
-  Printf.printf " PAPER-WATCH  |  %d papers  |  %d unread  |  %d keep\n" count unread keeps;
+  Printf.printf " PIWANA  |  %d papers  |  %d unread  |  %d keep\n" count unread keeps;
   print_endline (String.make (min width 100) '-');
   print_endline " j/k: paper  r: read  s: keep  x: skip  u: reset  t: translation  [/]: abstract page  q: quit";
   print_endline (String.make (min width 100) '-');
@@ -835,7 +835,7 @@ let main () =
     if papers = [] then (prerr_endline "No papers in database. Provide a TSV file on first run."; ignore (Sqlite3.db_close db); exit 0);
     let old_term = terminal_raw_mode () in
     let selected = ref 0 and show_japanese = ref false and abstract_scroll = ref 0 and running = ref true in
-    let finish () = restore_terminal old_term; clear_screen (); print_endline "paper-watch: SQLite state saved." in
+    let finish () = restore_terminal old_term; clear_screen (); print_endline "piwana: SQLite state saved." in
     (try
       while !running do
         render papers !selected !show_japanese !abstract_scroll;

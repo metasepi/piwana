@@ -1,4 +1,4 @@
-# paper-watch TUI (SQLite + DOI Abstract Fetch)
+# piwana TUI (SQLite + DOI Abstract Fetch)
 
 A small OCaml terminal application for reviewing papers. Review state is stored in SQLite.
 
@@ -15,11 +15,11 @@ opam install dune sqlite3 yojson
 
 ```sh
 dune build
-dune exec ./bin/paper_watch.exe
+dune exec ./bin/piwana.exe
 ```
 
-The database defaults to `~/.local/state/paper-watch/papers.sqlite3`.
-Set `PAPER_WATCH_DB` to use another database path.
+The database defaults to `~/.local/state/piwana/papers.sqlite3`.
+Set `PIWANA_DB` to use another database path.
 
 On first run, `papers.tsv` is imported if the database is empty. The bundled TSV contains **fictional UI sample records** with placeholder DOIs (`10.0000/...`); they are not real papers and cannot be used to test metadata retrieval.
 
@@ -38,13 +38,13 @@ https://doi.org/10.xxxx/example-three
 Import them into the current SQLite database:
 
 ```sh
-dune exec ./bin/paper_watch.exe -- --import-dois dois.txt
+dune exec ./bin/piwana.exe -- --import-dois dois.txt
 ```
 
 Then retrieve abstracts:
 
 ```sh
-dune exec ./bin/paper_watch.exe -- --fetch-abstracts
+dune exec ./bin/piwana.exe -- --fetch-abstracts
 ```
 
 The fetcher tries Crossref first and Semantic Scholar if Crossref has no abstract. When metadata is returned, title, authors, and year are also populated where available. It does not download PDFs.
@@ -83,7 +83,7 @@ The `--fetch-abstracts` command tries sources in this order: Crossref, Semantic 
 Collect OSDI papers from the official USENIX Technical Sessions page:
 
 ```sh
-dune exec ./bin/paper_watch.exe -- --collect OSDI 2026
+dune exec ./bin/piwana.exe -- --collect OSDI 2026
 ```
 
 The collector stores a stable edition/title-derived ID, title, authors, abstract, official presentation URL, source page URL, and collection timestamp. It does not overwrite review decisions. OSDI records currently have no DOI unless one is resolved separately. This first parser is experimental: compare the reported number of parsed records against the official table of contents before treating a run as complete.
@@ -96,7 +96,7 @@ For an official-proceedings collection such as OSDI 2026, discover Crossref DOI
 candidates for records that do not yet have a DOI:
 
 ```sh
-dune exec ./bin/paper_watch.exe -- --resolve-dois OSDI 2026
+dune exec ./bin/piwana.exe -- --resolve-dois OSDI 2026
 ```
 
 The command searches Crossref by title (five candidates per paper), records the
