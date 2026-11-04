@@ -9,7 +9,7 @@ On Debian/Ubuntu:
 
 ```sh
 sudo apt install libsqlite3-dev curl
-opam install dune sqlite3 yojson str
+opam install dune sqlite3 yojson str uutf
 ```
 
 ## Build and run
@@ -80,7 +80,8 @@ dune exec ./bin/piwana.exe -- --sync all 2026
 
 `all` is case-insensitive and runs OSDI, SOSP, ASPLOS, POPL, PLDI, CPP, and CAV
 in that order. If one conference fails, the remaining conferences still run and
-the failed ones are reported at the end.
+the failed ones are reported at the end. `--sync` does not translate abstracts;
+run `--translate` separately when you want Japanese text.
 
 To process a single conference instead:
 
@@ -118,6 +119,9 @@ dune exec ./bin/piwana.exe -- --apply-dois SOSP 2026
 
 # 3. Fetch abstracts for this edition.
 dune exec ./bin/piwana.exe -- --fetch-abstracts SOSP 2026
+
+# 4. Translate English abstracts into Japanese for this edition.
+dune exec ./bin/piwana.exe -- --translate SOSP 2026
 ```
 
 `--resolve-dois` is the lower-level lookup command. It stages exact-title
@@ -212,6 +216,67 @@ The `papers` table records `abstract_source`, `abstract_fetched_at`, and
 abstract remain visible and are not treated as successful. Papers marked
 `not_found` are retried by the next explicit `--fetch-abstracts` run.
 
+## Japanese translation
+
+```sh
+dune exec ./bin/piwana.exe -- --translate
+dune exec ./bin/piwana.exe -- --translate all
+dune exec ./bin/piwana.exe -- --translate SOSP 2026
+```
+
+`--translate` translates every paper that has an English abstract but no
+Japanese translation, optionally limited to one conference and year. Existing
+translations are skipped, so the command can be re-run to resume after a
+failure. Add `--refresh` to retranslate papers that already have a Japanese
+translation:
+
+```sh
+dune exec ./bin/piwana.exe -- --translate SOSP 2026 --refresh
+```
+
+In the TUI, pressing `t` on a paper without a translation fetches one, stores
+it in the database, and switches the abstract pane to Japanese. Pressing `t`
+again toggles between English and Japanese. The translation source is shown as
+`Translation source` in the detail pane.
+
+The default backend chain is `google_web,mymemory`:
+
+| Backend | Key required | Notes |
+| --- | --- | --- |
+| `google_web` | No | Google's public web endpoint; fast, but unofficial |
+| `mymemory` | No | Official free API; limited to about 500 characters per request and a small daily quota |
+| `deepl` | Yes | `DEEPL_API_KEY` or `PIWANA_DEEPL_API_KEY`; best quality |
+| `openai` | Yes | `OPENAI_API_KEY` or `PIWANA_OPENAI_API_KEY` |
+
+Configure the chain and pacing with environment variables:
+
+```sh
+export PIWANA_TRANSLATOR=google_web,mymemory
+export PIWANA_TRANSLATE_DELAY_MS=1000
+```
+
+For DeepL or OpenAI:
+
+```sh
+export PIWANA_TRANSLATOR=deepl,google_web
+export DEEPL_API_KEY=your-key
+
+# or
+export PIWANA_TRANSLATOR=openai,google_web
+export OPENAI_API_KEY=your-key
+export PIWANA_OPENAI_MODEL=gpt-4o-mini
+# export PIWANA_OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+`google_web` and `mymemory` use free, undocumented or quota-limited public
+endpoints. They can return HTTP 429 or stop working without notice. For large
+batches or long-term use, configure DeepL or an OpenAI-compatible API. Request
+failures fall through to the next backend in the chain.
+
+Translations are stored in `abstract_ja`, `abstract_ja_source`, and
+`abstract_ja_at`. The TUI wraps Japanese text by display width so wide
+characters are not split or counted as single columns.
+
 ## TUI keys
 
 - `j` / `k`: move down / up
@@ -219,7 +284,7 @@ abstract remain visible and are not treated as successful. Papers marked
 - `s`: Keep
 - `x`: Skip
 - `u`: reset to unread
-- `t`: toggle English / Japanese abstract
+- `t`: show Japanese; translate on first use, then toggle English / Japanese
 - `]` or `Space`: scroll the abstract down by half a screen
 - `[`: scroll the abstract up by half a screen
 - `g` / `G`: jump to the beginning / end of the abstract

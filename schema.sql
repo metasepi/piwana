@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS papers (
   abstract_ja TEXT NOT NULL DEFAULT '',
   metadata_source TEXT,
   abstract_source TEXT,
+  abstract_ja_source TEXT,
+  abstract_ja_at TEXT,
   metadata_updated_at TEXT,
   abstract_fetched_at TEXT,
   abstract_status TEXT NOT NULL DEFAULT 'pending',

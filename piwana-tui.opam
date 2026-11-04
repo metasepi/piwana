@@ -8,5 +8,6 @@ depends: [
   "sqlite3"
   "yojson"
   "str"
+  "uutf"
 ]
 build: [ ["dune" "build" "-p" name "-j" jobs] ]

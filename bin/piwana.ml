@@ -8,8 +8,9 @@ type paper = {
   conference : string;
   year : string;
   abstract_en : string;
-  abstract_ja : string;
+  mutable abstract_ja : string;
   abstract_source : string;
+  mutable abstract_ja_source : string;
   mutable reviewed : bool;
   mutable decision : decision;
 }
@@ -91,6 +92,8 @@ let init_schema db =
   ensure_column "abstract_fetched_at" "TEXT";
   ensure_column "abstract_status" "TEXT NOT NULL DEFAULT 'pending'";
   ensure_column "abstract_error" "TEXT";
+  ensure_column "abstract_ja_source" "TEXT";
+  ensure_column "abstract_ja_at" "TEXT";
   ensure_column "official_url" "TEXT";
   ensure_column "collection_source" "TEXT";
   ensure_column "collected_at" "TEXT";
@@ -180,18 +183,19 @@ let starts_with s prefix =
 let load_papers db =
   let stmt = Sqlite3.prepare db
     "SELECT p.id,COALESCE(p.doi,''),p.title,p.authors,p.conference,p.year,p.abstract_en,p.abstract_ja,COALESCE(p.abstract_source,''), \
+     COALESCE(p.abstract_ja_source,''), \
      CASE WHEN r.reviewed_at IS NULL THEN 0 ELSE 1 END,r.decision \
      FROM papers p LEFT JOIN reviews r ON r.paper_id=p.id \
      ORDER BY p.conference,p.year DESC,p.title" in
   let rec loop acc = match Sqlite3.step stmt with
     | Sqlite3.Rc.ROW ->
-        let reviewed = Sqlite3.column_int stmt 9 <> 0 in
+        let reviewed = Sqlite3.column_int stmt 10 <> 0 in
         let p = {
           id=text_column stmt 0; doi=text_column stmt 1; title=text_column stmt 2;
           authors=text_column stmt 3; conference=text_column stmt 4; year=text_column stmt 5;
           abstract_en=text_column stmt 6; abstract_ja=text_column stmt 7;
-          abstract_source=text_column stmt 8;
-          reviewed; decision=decision_of_string (text_column stmt 10)
+          abstract_source=text_column stmt 8; abstract_ja_source=text_column stmt 9;
+          reviewed; decision=decision_of_string (text_column stmt 11)
         } in loop (p :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
     | rc -> check_rc "Loading papers" rc; List.rev acc
@@ -217,11 +221,18 @@ let percent_encode_path s =
     | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
   Buffer.contents b
 
-let http_get_with_headers_status headers url =
+let http_request_status ?(method_="GET") ?(headers=[]) ?content_type ?body url =
   let header_args = String.concat " " (List.map (fun h -> "-H " ^ shell_quote h) headers) in
+  let content_type_arg = match content_type with
+    | Some ct -> " -H " ^ shell_quote ("Content-Type: " ^ ct)
+    | None -> "" in
+  let method_arg = if method_ = "GET" then "" else " -X " ^ method_ in
+  let body_arg = match body with
+    | Some b -> " --data-binary " ^ shell_quote b
+    | None -> "" in
   let command =
-    "curl -sSL --connect-timeout 8 --max-time 30 " ^ header_args ^
-    " -w '%{http_code}' " ^ shell_quote url ^ " 2>/dev/null" in
+    "curl -sSL --connect-timeout 8 --max-time 60 " ^ header_args ^ content_type_arg ^
+    method_arg ^ body_arg ^ " -w '%{http_code}' " ^ shell_quote url ^ " 2>/dev/null" in
   let ic = Unix.open_process_in command in
   let contents =
     let b = Buffer.create 4096 in
@@ -240,6 +251,8 @@ let http_get_with_headers_status headers url =
       else 0 in
     let body = if len >= 3 then String.sub contents 0 (len - 3) else contents in
     (status, body)
+
+let http_get_with_headers_status headers url = http_request_status ~headers url
 
 let http_get_with_headers headers url =
   match http_get_with_headers_status headers url with
@@ -729,6 +742,323 @@ let percent_encode_component s =
     | 'a'..'z' | 'A'..'Z' | '0'..'9' | '-' | '_' | '.' | '~' -> Buffer.add_char b c
     | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
   Buffer.contents b
+
+(* ------------------------------------------------------------------ *)
+(* Japanese translation                                                *)
+(* ------------------------------------------------------------------ *)
+
+let string_contains haystack needle =
+  let re = Str.regexp_string needle in
+  try ignore (Str.search_forward re haystack 0); true with Not_found -> false
+
+let env_nonempty names =
+  let rec loop = function
+    | [] -> None
+    | name :: rest ->
+        (match Sys.getenv_opt name with
+         | Some value when String.trim value <> "" -> Some (String.trim value)
+         | _ -> loop rest)
+  in
+  loop names
+
+let translation_backends () =
+  match env_nonempty ["PIWANA_TRANSLATOR"] with
+  | None -> ["google_web"; "mymemory"]
+  | Some value ->
+      String.split_on_char ',' value
+      |> List.map String.trim
+      |> List.filter ((<>) "")
+
+let translation_delay () =
+  match env_nonempty ["PIWANA_TRANSLATE_DELAY_MS"] with
+  | Some value ->
+      (match float_of_string_opt value with
+       | Some ms -> max 0.0 (ms /. 1000.0)
+       | None -> 1.0)
+  | None -> 1.0
+
+let retry_delay attempt =
+  match attempt with 0 -> 1.0 | 1 -> 3.0 | 2 -> 8.0 | _ -> 15.0
+
+let request_text_with_retry ?(tries=3) ?(method_="GET") ?(headers=[])
+    ?content_type ?body url =
+  let rec attempt n =
+    match http_request_status ~method_ ~headers ?content_type ?body url with
+    | status, response when status >= 200 && status < 300 -> Some response
+    | status, _ when (status = 429 || status = 403 || status >= 500) && n > 0 ->
+        Unix.sleepf (retry_delay (tries - n));
+        attempt (n - 1)
+    | _ -> None
+  in
+  attempt tries
+
+let utf8_backoff s pos =
+  let pos = min pos (String.length s) in
+  let rec loop p =
+    if p <= 0 then 0
+    else if Char.code s.[p] land 0xC0 = 0x80 then loop (p - 1)
+    else p
+  in
+  loop pos
+
+(* Split at UTF-8 boundaries, preferring a space, newline, or sentence end. *)
+let split_text_chunks max_bytes text =
+  let len = String.length text in
+  let rec loop start acc =
+    if start >= len then List.rev acc
+    else if len - start <= max_bytes then
+      List.rev (String.sub text start (len - start) :: acc)
+    else
+      let limit = start + max_bytes in
+      let search_from = start + (max_bytes / 2) in
+      let rec find_break i best =
+        if i < search_from then best
+        else
+          let best =
+            match text.[i] with
+            | ' ' | '\n' | '\t' | '.' | ';' | ':' -> i
+            | _ -> best
+          in
+          find_break (i - 1) best
+      in
+      let raw_break = find_break limit (-1) in
+      let break =
+        if raw_break > start then raw_break + 1
+        else utf8_backoff text limit
+      in
+      let break = if break <= start then utf8_backoff text limit else break in
+      let break = max (start + 1) (min break len) in
+      loop break (String.sub text start (break - start) :: acc)
+  in
+  loop 0 []
+
+let parse_google_translation body =
+  try
+    match Yojson.Basic.from_string body with
+    | `List items ->
+        let text = String.concat "" (List.filter_map (function
+          | `String s -> Some s
+          | `List (`String s :: _) -> Some s
+          | _ -> None) items) in
+        if String.trim text = "" then None else Some text
+    | _ -> None
+  with _ -> None
+
+let google_translate text =
+  let chunks = split_text_chunks 900 text in
+  let rec loop acc = function
+    | [] -> Some (String.concat "" (List.rev acc))
+    | chunk :: rest ->
+        let url =
+          "https://clients5.google.com/translate_a/t?client=dict-chrome-ex" ^
+          "&sl=en&tl=ja&q=" ^ percent_encode_component chunk in
+        (match request_text_with_retry
+          ~headers:["Accept: application/json";
+                    "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"]
+          url with
+         | None -> None
+         | Some body ->
+             (match parse_google_translation body with
+              | None -> None
+              | Some translated ->
+                  (match rest with [] -> () | _ -> Unix.sleepf 0.5);
+                  loop (translated :: acc) rest))
+  in
+  loop [] chunks
+
+let mymemory_translate text =
+  let chunks = split_text_chunks 450 text in
+  let rec loop acc = function
+    | [] -> Some (String.concat "" (List.rev acc))
+    | chunk :: rest ->
+        let url =
+          "https://api.mymemory.translated.net/get?q=" ^
+          percent_encode_component chunk ^ "&langpair=en%7Cja" in
+        (match request_text_with_retry ~headers:["Accept: application/json"] url with
+         | None -> None
+         | Some body ->
+             (try
+               let root = Yojson.Basic.from_string body in
+               let data = json_field "responseData" root in
+               let translated = json_string (json_field "translatedText" data) in
+               let status = json_string (json_field "responseStatus" root) in
+               let quota_finished = json_field "quotaFinished" root = `Bool true in
+               if quota_finished ||
+                  (status <> "" && status <> "200") ||
+                  string_contains translated "MYMEMORY WARNING" ||
+                  string_contains translated "QUERY LENGTH LIMIT"
+               then None
+               else
+                 let translated = html_unescape translated in
+                 if String.trim translated = "" then None
+                 else loop (translated :: acc) rest
+             with _ -> None))
+  in
+  loop [] chunks
+
+let deepl_translate text =
+  match env_nonempty ["PIWANA_DEEPL_API_KEY"; "DEEPL_API_KEY"] with
+  | None -> None
+  | Some key ->
+      let url =
+        match env_nonempty ["PIWANA_DEEPL_URL"] with
+        | Some url -> url
+        | None ->
+            if Filename.check_suffix key ":fx"
+            then "https://api-free.deepl.com/v2/translate"
+            else "https://api.deepl.com/v2/translate" in
+      let chunks = split_text_chunks 3000 text in
+      let rec loop acc = function
+        | [] -> Some (String.concat "" (List.rev acc))
+        | chunk :: rest ->
+            let body =
+              "text=" ^ percent_encode_component chunk ^
+              "&source_lang=EN&target_lang=JA" in
+            (match request_text_with_retry ~method_:"POST"
+              ~headers:["Accept: application/json";
+                        "Authorization: DeepL-Auth-Key " ^ key]
+              ~content_type:"application/x-www-form-urlencoded" ~body url with
+             | None -> None
+             | Some response ->
+                 (try
+                   let root = Yojson.Basic.from_string response in
+                   let translated = match json_field "translations" root with
+                     | `List (item :: _) -> json_string (json_field "text" item)
+                     | _ -> "" in
+                   if String.trim translated = "" then None
+                   else loop (translated :: acc) rest
+                 with _ -> None))
+      in
+      loop [] chunks
+
+let openai_translate text =
+  match env_nonempty ["PIWANA_OPENAI_API_KEY"; "OPENAI_API_KEY"] with
+  | None -> None
+  | Some key ->
+      let base =
+        match env_nonempty ["PIWANA_OPENAI_BASE_URL"] with
+        | Some url -> url
+        | None -> "https://api.openai.com/v1" in
+      let base =
+        if base <> "" && base.[String.length base - 1] = '/'
+        then String.sub base 0 (String.length base - 1)
+        else base in
+      let model =
+        match env_nonempty ["PIWANA_OPENAI_MODEL"] with
+        | Some model -> model
+        | None -> "gpt-4o-mini" in
+      let system_prompt =
+        "Translate the following English academic paper abstract into natural Japanese. " ^
+        "Preserve technical terms, acronyms, numbers, and citations. " ^
+        "Output only the translation, without notes or explanations." in
+      let chunks = split_text_chunks 6000 text in
+      let rec loop acc = function
+        | [] -> Some (String.concat "" (List.rev acc))
+        | chunk :: rest ->
+            let payload = `Assoc [
+              "model", `String model;
+              "temperature", `Float 0.0;
+              "messages", `List [
+                `Assoc ["role", `String "system"; "content", `String system_prompt];
+                `Assoc ["role", `String "user"; "content", `String chunk]
+              ]
+            ] in
+            let body = Yojson.Basic.to_string payload in
+            (match request_text_with_retry ~method_:"POST"
+              ~headers:["Accept: application/json";
+                        "Authorization: Bearer " ^ key]
+              ~content_type:"application/json" ~body (base ^ "/chat/completions") with
+             | None -> None
+             | Some response ->
+                 (try
+                   let root = Yojson.Basic.from_string response in
+                   let translated = match json_field "choices" root with
+                     | `List (choice :: _) ->
+                         let message = json_field "message" choice in
+                         json_string (json_field "content" message)
+                     | _ -> "" in
+                   if String.trim translated = "" then None
+                   else loop (translated :: acc) rest
+                 with _ -> None))
+      in
+      loop [] chunks
+
+let disabled_translation_backends : (string, unit) Hashtbl.t = Hashtbl.create 4
+
+let translate_with backend text =
+  if Hashtbl.mem disabled_translation_backends backend then None
+  else
+    let result =
+      match backend with
+      | "google_web" | "google" -> google_translate text
+      | "mymemory" -> mymemory_translate text
+      | "deepl" -> deepl_translate text
+      | "openai" | "gpt" -> openai_translate text
+      | _ -> None
+    in
+    (match result with
+     | None -> Hashtbl.replace disabled_translation_backends backend ()
+     | Some _ -> ());
+    result
+
+let translate_abstract text =
+  if String.trim text = "" then None
+  else
+    let rec loop = function
+      | [] -> None
+      | backend :: rest ->
+          (match translate_with backend text with
+           | Some translated when String.trim translated <> "" -> Some (translated, backend)
+           | _ -> loop rest)
+    in
+    loop (translation_backends ())
+
+let store_translation db id text source =
+  exec db (Printf.sprintf
+    "UPDATE papers SET abstract_ja=%s,abstract_ja_source=%s,abstract_ja_at=%s WHERE id=%s"
+    (sql_quote text) (sql_quote source) (sql_quote (now_iso ())) (sql_quote id))
+
+let save_translation db p text source =
+  p.abstract_ja <- text;
+  p.abstract_ja_source <- source;
+  store_translation db p.id text source
+
+let translate_papers db ~conference ~year ~refresh =
+  let filters = ["abstract_en<>''"] in
+  let filters =
+    if refresh then filters
+    else filters @ ["(abstract_ja IS NULL OR abstract_ja='')"] in
+  let filters =
+    if conference = "" then filters else filters @ ["conference=" ^ sql_quote conference] in
+  let filters = if year = "" then filters else filters @ ["year=" ^ sql_quote year] in
+  let where = String.concat " AND " filters in
+  let stmt = Sqlite3.prepare db
+    ("SELECT id,abstract_en,title FROM papers WHERE " ^ where ^
+     " ORDER BY conference,year,title") in
+  let rec collect acc = match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW ->
+        collect ((text_column stmt 0, text_column stmt 1, text_column stmt 2) :: acc)
+    | Sqlite3.Rc.DONE -> List.rev acc
+    | rc -> check_rc "Selecting papers to translate" rc; List.rev acc
+  in
+  let rows = collect [] in
+  ignore (Sqlite3.finalize stmt);
+  let delay = translation_delay () in
+  let ok = ref 0 and missing = ref 0 in
+  List.iteri (fun i (id, abstract_en, title) ->
+    if i > 0 && delay > 0.0 then Unix.sleepf delay;
+    Printf.printf "Translating %s ... %!" title;
+    match translate_abstract abstract_en with
+    | Some (translated, source) ->
+        store_translation db id translated source;
+        incr ok;
+        Printf.printf " %s (%d chars)\n%!" source (String.length translated)
+    | None ->
+        incr missing;
+        print_endline " not translated"
+  ) rows;
+  Printf.printf "Translation complete: %d translated, %d unavailable, %d checked.\n%!"
+    !ok !missing (List.length rows)
 
 (* ------------------------------------------------------------------ *)
 (* DOI policy and proceedings collectors                               *)
@@ -1488,9 +1818,67 @@ let status_label p =
   | _, Keep -> "KEEP"
   | _, Skip -> "SKIP"
 
+let uchar_width u =
+  let n = Uchar.to_int u in
+  if n = 0 then 0
+  else if n < 32 || (n >= 0x7F && n < 0xA0) then 0
+  else if (n >= 0x0300 && n <= 0x036F) ||
+          (n >= 0x1AB0 && n <= 0x1AFF) ||
+          (n >= 0x1DC0 && n <= 0x1DFF) ||
+          (n >= 0x20D0 && n <= 0x20FF) ||
+          (n >= 0xFE20 && n <= 0xFE2F) then 0
+  else if n = 0x200B || (n >= 0x200E && n <= 0x200F) || n = 0xFEFF then 0
+  else if (n >= 0x1100 && n <= 0x115F) ||
+          (n >= 0x2E80 && n <= 0x303E) ||
+          (n >= 0x3041 && n <= 0x33FF) ||
+          (n >= 0x3400 && n <= 0x4DBF) ||
+          (n >= 0x4E00 && n <= 0x9FFF) ||
+          (n >= 0xA000 && n <= 0xA4CF) ||
+          (n >= 0xAC00 && n <= 0xD7A3) ||
+          (n >= 0xF900 && n <= 0xFAFF) ||
+          (n >= 0xFE10 && n <= 0xFE19) ||
+          (n >= 0xFE30 && n <= 0xFE6F) ||
+          (n >= 0xFF00 && n <= 0xFF60) ||
+          (n >= 0xFFE0 && n <= 0xFFE6) ||
+          (n >= 0x1F300 && n <= 0x1FAFF) ||
+          (n >= 0x20000 && n <= 0x3FFFD) then 2
+  else 1
+
+type display_char = { bytes : string; width : int }
+
+let utf8_display_chars s =
+  let decoder = Uutf.decoder ~encoding:`UTF_8 (`String s) in
+  let buf = Buffer.create 4 in
+  let rec loop acc =
+    match Uutf.decode decoder with
+    | `Uchar u ->
+        Buffer.clear buf;
+        Uutf.Buffer.add_utf_8 buf u;
+        loop ({ bytes = Buffer.contents buf; width = uchar_width u } :: acc)
+    | `Malformed bytes ->
+        loop ({ bytes; width = 1 } :: acc)
+    | `End -> List.rev acc
+    | `Await -> List.rev acc
+  in
+  loop []
+
+let display_width s =
+  List.fold_left (fun total c -> total + c.width) 0 (utf8_display_chars s)
+
 let truncate width s =
-  if width <= 3 || String.length s <= width then s
-  else String.sub s 0 (width - 3) ^ "..."
+  if width <= 3 then "..."
+  else if display_width s <= width then s
+  else
+    let target = width - 3 in
+    let b = Buffer.create (String.length s) in
+    let rec loop used = function
+      | [] -> ()
+      | c :: rest ->
+          if used + c.width > target then ()
+          else (Buffer.add_string b c.bytes; loop (used + c.width) rest)
+    in
+    loop 0 (utf8_display_chars s);
+    Buffer.contents b ^ "..."
 
 let terminal_size () =
   try
@@ -1502,28 +1890,50 @@ let terminal_size () =
     | _ -> (80, 24)
   with _ -> (80, 24)
 
+let is_space_char c = c.bytes = " " || c.bytes = "\t" || c.bytes = "\r"
+
+let wrap_paragraph width chars =
+  let emit line acc =
+    let text = String.concat "" (List.map (fun c -> c.bytes) line) |> String.trim in
+    if text = "" then acc else text :: acc
+  in
+  let rec loop line line_width acc remaining =
+    match remaining with
+    | [] -> List.rev (emit line acc)
+    | c :: rest ->
+        if c.width = 0 then loop (line @ [c]) line_width acc rest
+        else if line_width + c.width <= width then
+          loop (line @ [c]) (line_width + c.width) acc rest
+        else if line = [] then
+          loop [c] c.width acc rest
+        else
+          let rec last_space i found = function
+            | [] -> found
+            | x :: xs ->
+                let found = if is_space_char x then i else found in
+                last_space (i + 1) found xs
+          in
+          let space_index = last_space 0 (-1) line in
+          if space_index >= 0 then (
+            let before = List.filteri (fun i _ -> i < space_index) line in
+            let after = List.filteri (fun i _ -> i > space_index) line in
+            let acc = emit before acc in
+            let new_line = after @ [c] in
+            let new_width = List.fold_left (fun n x -> n + x.width) 0 new_line in
+            loop new_line new_width acc rest
+          ) else (
+            let acc = emit line acc in
+            loop [c] c.width acc rest
+          )
+  in
+  loop [] 0 [] chars
+
 let wrap_text width text =
   let width = max 10 width in
-  let wrap_paragraph paragraph =
-    let words = String.split_on_char ' ' (String.trim paragraph) |> List.filter ((<>) "") in
-    let rec loop current_len current acc = function
-      | [] -> List.rev (if current = "" then acc else current :: acc)
-      | word :: rest ->
-          if String.length word > width then
-            let head = String.sub word 0 width in
-            let tail = String.sub word width (String.length word - width) in
-            if current = "" then loop width head acc (tail :: rest)
-            else loop 0 "" (current :: acc) (word :: rest)
-          else if current = "" then loop (String.length word) word acc rest
-          else if current_len + 1 + String.length word <= width then
-            loop (current_len + 1 + String.length word) (current ^ " " ^ word) acc rest
-          else loop (String.length word) word (current :: acc) rest
-    in
-    loop 0 "" [] words
-  in
   String.split_on_char '\n' text
   |> List.concat_map (fun paragraph ->
-       if String.trim paragraph = "" then [""] else wrap_paragraph paragraph)
+       if String.trim paragraph = "" then [""]
+       else wrap_paragraph width (utf8_display_chars paragraph))
 
 let clear_screen () = print_string "\027[2J\027[H"
 
@@ -1544,7 +1954,7 @@ let read_key () =
   let n = Unix.read Unix.stdin b 0 1 in
   if n = 0 then 'q' else Bytes.get b 0
 
-let render papers selected show_japanese abstract_scroll =
+let render papers selected show_japanese abstract_scroll notice =
   clear_screen ();
   let width, height = terminal_size () in
   let count = List.length papers in
@@ -1572,18 +1982,23 @@ let render papers selected show_japanese abstract_scroll =
       Printf.printf "DOI: %s\n" (if p.doi = "" then "(none)" else p.doi);
       Printf.printf "Authors: %s\n" (truncate width p.authors);
       Printf.printf "Abstract source: %s\n" (if p.abstract_source = "" then "not available" else p.abstract_source);
+      if p.abstract_ja_source <> "" then
+        Printf.printf "Translation source: %s\n" p.abstract_ja_source;
       print_endline "ABSTRACT";
       print_endline "--------";
       let abstract = if show_japanese && p.abstract_ja <> "" then p.abstract_ja else p.abstract_en in
       let abstract = if abstract = "" then "[No abstract available.]" else abstract in
       let lines = wrap_text (width - 2) abstract in
-      let reserved = 13 + (last - first) + (if count > list_rows then 1 else 0) in
+      let reserved = 13 + (last - first) + (if count > list_rows then 1 else 0)
+                     + (if p.abstract_ja_source <> "" then 1 else 0)
+                     + (if notice = "" then 0 else 1) in
       let visible = max 4 (height - reserved) in
       let max_scroll = max 0 (List.length lines - visible) in
       let scroll = min abstract_scroll max_scroll in
       List.iter print_endline (List.filteri (fun i _ -> i >= scroll && i < scroll + visible) lines);
       if max_scroll > 0 then Printf.printf "\nAbstract lines %d-%d of %d\n" (scroll + 1) (min (scroll + visible) (List.length lines)) (List.length lines);
       if show_japanese && p.abstract_ja = "" then print_endline "[No Japanese translation available.]";
+      if notice <> "" then Printf.printf "\n%s\n" notice;
       Printf.printf "\nCurrent state: %s\n" (status_label p);
       flush stdout
 
@@ -1604,6 +2019,19 @@ let main () =
       let conference = if Array.length Sys.argv > 2 then String.uppercase_ascii Sys.argv.(2) else "" in
       let year = if Array.length Sys.argv > 3 then Sys.argv.(3) else "" in
       fetch_abstracts ~conference ~year db; ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--translate" then (
+      let args = Array.to_list Sys.argv |> List.tl |> List.tl in
+      let refresh = List.mem "--refresh" args in
+      let positional = List.filter (fun arg -> arg <> "--refresh") args in
+      let conference = match positional with
+        | value :: _ -> String.uppercase_ascii value
+        | [] -> "" in
+      let conference = if conference = "ALL" then "" else conference in
+      let year = match positional with
+        | _ :: value :: _ -> value
+        | _ -> "" in
+      translate_papers db ~conference ~year ~refresh; ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--resolve-dois" && Array.length Sys.argv > 3 then (
       let refresh = Array.length Sys.argv > 4 && Sys.argv.(4) = "--refresh" in
@@ -1635,11 +2063,13 @@ let main () =
       ignore (Sqlite3.db_close db); exit 0);
     let old_term = terminal_raw_mode () in
     let selected = ref 0 and show_japanese = ref false and abstract_scroll = ref 0 and running = ref true in
+    let notice = ref "" in
     let finish () = restore_terminal old_term; clear_screen (); print_endline "piwana: SQLite state saved." in
     (try
       while !running do
-        render papers !selected !show_japanese !abstract_scroll;
+        render papers !selected !show_japanese !abstract_scroll !notice;
         let key = read_key () in
+        if key <> 't' then notice := "";
         let p = List.nth papers !selected in
         (match key with
          | 'j' -> selected := min (List.length papers - 1) (!selected + 1); abstract_scroll := 0
@@ -1648,7 +2078,25 @@ let main () =
          | 's' -> set_state db p true Keep
          | 'x' -> set_state db p true Skip
          | 'u' -> set_state db p false Undecided
-         | 't' -> show_japanese := not !show_japanese; abstract_scroll := 0
+         | 't' ->
+             if p.abstract_ja <> "" then (
+               notice := "";
+               show_japanese := not !show_japanese;
+               abstract_scroll := 0
+             ) else if String.trim p.abstract_en = "" then
+               notice := "No English abstract is available to translate."
+             else (
+               notice := "Translating... (this may take a few seconds)";
+               abstract_scroll := 0;
+               render papers !selected !show_japanese !abstract_scroll !notice;
+               match translate_abstract p.abstract_en with
+               | Some (translated, source) ->
+                   save_translation db p translated source;
+                   show_japanese := true;
+                   notice := ""
+               | None ->
+                   notice := "Translation failed. Check the backend settings in README.md."
+             )
          | ']' | ' ' -> abstract_scroll := !abstract_scroll + max 1 (snd (terminal_size ()) / 2)
          | '[' -> abstract_scroll := max 0 (!abstract_scroll - max 1 (snd (terminal_size ()) / 2))
          | 'g' -> abstract_scroll := 0
