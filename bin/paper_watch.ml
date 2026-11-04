@@ -93,7 +93,8 @@ let init_schema db =
   ensure_column "abstract_error" "TEXT";
   ensure_column "official_url" "TEXT";
   ensure_column "collection_source" "TEXT";
-  ensure_column "collected_at" "TEXT"
+  ensure_column "collected_at" "TEXT";
+  exec db "CREATE TABLE IF NOT EXISTS doi_candidates (    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,    source TEXT NOT NULL, doi TEXT NOT NULL, candidate_title TEXT NOT NULL DEFAULT '',    candidate_authors TEXT NOT NULL DEFAULT '', candidate_year TEXT NOT NULL DEFAULT '',    score REAL, exact_title INTEGER NOT NULL DEFAULT 0, retrieved_at TEXT NOT NULL,    PRIMARY KEY(paper_id,source,doi))"
 
 let scalar_int db sql =
   let stmt = Sqlite3.prepare db sql in
@@ -555,6 +556,93 @@ let normalize_title s =
   ) s;
   Buffer.contents b
 
+let percent_encode_component s =
+  let b = Buffer.create (String.length s) in
+  String.iter (fun c ->
+    match c with
+    | 'a'..'z' | 'A'..'Z' | '0'..'9' | '-' | '_' | '.' | '~' -> Buffer.add_char b c
+    | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
+  Buffer.contents b
+
+let crossref_title_candidates title =
+  let url = "https://api.crossref.org/works?query.title=" ^ percent_encode_component title ^
+    "&rows=5" in
+  match http_get url with
+  | None -> []
+  | Some body ->
+      (try
+        let root = Yojson.Basic.from_string body in
+        let message = json_field "message" root in
+        match json_field "items" message with
+        | `List items -> List.filter_map (fun item ->
+            let doi = json_string (json_field "DOI" item) in
+            let candidate_title = match json_field "title" item with `List (`String t::_) -> t | _ -> "" in
+            if doi = "" || candidate_title = "" then None else
+            let candidate_authors = match json_field "author" item with
+              | `List xs -> String.concat ", " (List.filter ((<>) "") (List.map (fun a ->
+                  let given = json_string (json_field "given" a) in
+                  let family = json_string (json_field "family" a) in
+                  String.trim (given ^ " " ^ family)) xs))
+              | _ -> "" in
+            let candidate_year = json_year (json_field "published" item) in
+            let score = match json_field "score" item with `Float f -> Some f | `Int n -> Some (float_of_int n) | _ -> None in
+            Some (doi,candidate_title,candidate_authors,candidate_year,score)
+          ) items
+        | _ -> []
+       with _ -> [])
+
+let resolve_dois db conference year =
+  let stmt = Sqlite3.prepare db
+    "SELECT id,title,authors,year FROM papers WHERE conference=?1 AND year=?2 AND (doi IS NULL OR doi='') AND official_url IS NOT NULL AND official_url<>'' ORDER BY title" in
+  ignore (Sqlite3.bind stmt 1 (Sqlite3.Data.TEXT conference));
+  ignore (Sqlite3.bind stmt 2 (Sqlite3.Data.TEXT year));
+  let rec read acc = match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW -> read ((text_column stmt 0,text_column stmt 1,text_column stmt 2,text_column stmt 3)::acc)
+    | Sqlite3.Rc.DONE -> List.rev acc
+    | rc -> check_rc "Selecting DOI candidates" rc; List.rev acc
+  in
+  let papers = read [] in
+  ignore (Sqlite3.finalize stmt);
+  let exact_count = ref 0 and candidate_count = ref 0 and no_match = ref 0 in
+  Printf.printf "Resolving missing DOIs for %s %s: %d paper(s)\n%!" conference year (List.length papers);
+  List.iter (fun (id,title,authors,paper_year) ->
+    Printf.printf "\n%s\n  %s\n%!" id title;
+    Unix.sleepf 0.25;
+    let candidates = crossref_title_candidates title in
+    let exact = List.filter (fun (_,t,_,_,_) -> normalize_title t = normalize_title title) candidates in
+    List.iter (fun (doi,t,a,y,score) ->
+      exec db (Printf.sprintf
+        "INSERT INTO doi_candidates(paper_id,source,doi,candidate_title,candidate_authors,candidate_year,score,exact_title,retrieved_at) VALUES(%s,'crossref',%s,%s,%s,%s,%s,%d,%s) ON CONFLICT(paper_id,source,doi) DO UPDATE SET candidate_title=excluded.candidate_title,candidate_authors=excluded.candidate_authors,candidate_year=excluded.candidate_year,score=excluded.score,exact_title=excluded.exact_title,retrieved_at=excluded.retrieved_at"
+        (sql_quote id) (sql_quote doi) (sql_quote t) (sql_quote a) (sql_quote y)
+        (match score with Some f -> Printf.sprintf "%g" f | None -> "NULL")
+        (if normalize_title t = normalize_title title then 1 else 0) (sql_quote (now_iso ())))
+    ) candidates;
+    candidate_count := !candidate_count + List.length candidates;
+    if exact <> [] then (
+      incr exact_count;
+      Printf.printf "  EXACT TITLE CANDIDATE(S): %d (not assigned automatically)\n%!" (List.length exact);
+      List.iter (fun (doi,t,a,y,score) ->
+        Printf.printf "    DOI: %s\n    Authors: %s\n    Year: %s (paper year: %s)\n    Crossref score: %s\n%!"
+          doi (if a = "" then "(not supplied)" else a)
+          (if y = "" then "(not supplied)" else y) paper_year
+          (match score with Some f -> Printf.sprintf "%.2f" f | None -> "(not supplied)");
+        ignore t
+      ) exact
+    ) else (
+      incr no_match;
+      Printf.printf "  NO EXACT TITLE MATCH: %d candidate(s) staged for review\n%!" (List.length candidates);
+      List.iter (fun (doi,t,a,y,score) ->
+        Printf.printf "    %s  %s%s\n%!" doi t
+          (match score with Some f -> Printf.sprintf " [score %.2f]" f | None -> "");
+        ignore a; ignore y
+      ) candidates
+    );
+    ignore authors
+  ) papers;
+  Printf.printf "\nDOI candidate search: %d papers with exact-title candidates, %d without exact title match, %d candidate records staged.\n%!"
+    !exact_count !no_match !candidate_count;
+  print_endline "No DOI values were assigned. Review candidates before applying any DOI."
+
 let query_osdi_official_rows db year =
   let stmt = Sqlite3.prepare db
     "SELECT title, COALESCE(official_url,''), COALESCE(abstract_en,''), COALESCE(doi,'') \
@@ -730,6 +818,10 @@ let main () =
     );
     if command = "--fetch-abstracts" then (
       fetch_abstracts db; ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--resolve-dois" && Array.length Sys.argv > 3 then (
+      resolve_dois db (String.uppercase_ascii Sys.argv.(2)) Sys.argv.(3);
+      ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--verify" && Array.length Sys.argv > 3 && String.uppercase_ascii Sys.argv.(2) = "OSDI" then (
       verify_osdi db Sys.argv.(3); ignore (Sqlite3.db_close db); exit 0

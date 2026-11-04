@@ -89,3 +89,43 @@ dune exec ./bin/paper_watch.exe -- --collect OSDI 2026
 The collector stores a stable edition/title-derived ID, title, authors, abstract, official presentation URL, source page URL, and collection timestamp. It does not overwrite review decisions. OSDI records currently have no DOI unless one is resolved separately. This first parser is experimental: compare the reported number of parsed records against the official table of contents before treating a run as complete.
 
 The collector requires `curl` and network access. It adds `official_url`, `collection_source`, and `collected_at` columns automatically to existing databases.
+
+## DOI candidate discovery
+
+For an official-proceedings collection such as OSDI 2026, discover Crossref DOI
+candidates for records that do not yet have a DOI:
+
+```sh
+dune exec ./bin/paper_watch.exe -- --resolve-dois OSDI 2026
+```
+
+The command searches Crossref by title (five candidates per paper), records the
+results in the `doi_candidates` SQLite table, and prints exact-title and
+non-exact candidates. It deliberately **does not assign any DOI automatically**:
+identical titles, author-name variations, and publication-year differences need
+review before a DOI is written to `papers.doi`.
+
+Inspect exact-title candidates:
+
+```sql
+SELECT p.title, c.doi, c.candidate_title, c.candidate_authors,
+       c.candidate_year, c.score
+FROM doi_candidates c JOIN papers p ON p.id = c.paper_id
+WHERE p.conference = 'OSDI' AND p.year = '2026' AND c.exact_title = 1
+ORDER BY p.title, c.score DESC;
+```
+
+Inspect papers with no exact-title candidate:
+
+```sql
+SELECT p.title, c.doi, c.candidate_title, c.candidate_authors, c.candidate_year, c.score
+FROM papers p LEFT JOIN doi_candidates c ON c.paper_id = p.id
+WHERE p.conference = 'OSDI' AND p.year = '2026' AND (p.doi IS NULL OR p.doi = '')
+  AND NOT EXISTS (SELECT 1 FROM doi_candidates x
+                  WHERE x.paper_id = p.id AND x.exact_title = 1)
+ORDER BY p.title, c.score DESC;
+```
+
+Candidate discovery is repeatable; subsequent runs refresh the candidate rows.
+The `papers.doi` field remains unchanged until a separate, reviewed approval
+step is implemented.
