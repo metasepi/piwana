@@ -10,6 +10,7 @@ type paper = {
   abstract_en : string;
   mutable abstract_ja : string;
   abstract_source : string;
+  abstract_status : string;
   mutable abstract_ja_source : string;
   mutable reviewed : bool;
   mutable decision : decision;
@@ -183,19 +184,20 @@ let starts_with s prefix =
 let load_papers db =
   let stmt = Sqlite3.prepare db
     "SELECT p.id,COALESCE(p.doi,''),p.title,p.authors,p.conference,p.year,p.abstract_en,p.abstract_ja,COALESCE(p.abstract_source,''), \
-     COALESCE(p.abstract_ja_source,''), \
+     COALESCE(p.abstract_status,''),COALESCE(p.abstract_ja_source,''), \
      CASE WHEN r.reviewed_at IS NULL THEN 0 ELSE 1 END,r.decision \
      FROM papers p LEFT JOIN reviews r ON r.paper_id=p.id \
      ORDER BY p.conference,p.year DESC,p.title" in
   let rec loop acc = match Sqlite3.step stmt with
     | Sqlite3.Rc.ROW ->
-        let reviewed = Sqlite3.column_int stmt 10 <> 0 in
+        let reviewed = Sqlite3.column_int stmt 11 <> 0 in
         let p = {
           id=text_column stmt 0; doi=text_column stmt 1; title=text_column stmt 2;
           authors=text_column stmt 3; conference=text_column stmt 4; year=text_column stmt 5;
           abstract_en=text_column stmt 6; abstract_ja=text_column stmt 7;
-          abstract_source=text_column stmt 8; abstract_ja_source=text_column stmt 9;
-          reviewed; decision=decision_of_string (text_column stmt 11)
+          abstract_source=text_column stmt 8; abstract_status=text_column stmt 9;
+          abstract_ja_source=text_column stmt 10;
+          reviewed; decision=decision_of_string (text_column stmt 12)
         } in loop (p :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
     | rc -> check_rc "Loading papers" rc; List.rev acc
@@ -402,6 +404,71 @@ let semantic_scholar_record doi =
   in
   attempt 4
 
+let list_chunks n xs =
+  let rec split k acc = function
+    | [] -> (List.rev acc, [])
+    | rest when k = 0 -> (List.rev acc, rest)
+    | x :: rest -> split (k - 1) (x :: acc) rest
+  in
+  let rec loop acc = function
+    | [] -> List.rev acc
+    | xs ->
+        let chunk, rest = split n [] xs in
+        loop (chunk :: acc) rest
+  in
+  loop [] xs
+
+(* Batch endpoint: up to 500 IDs per request.  [None] means the request
+   itself failed (for example HTTP 429); an empty list means the request
+   succeeded but none of the papers had an abstract. *)
+let semantic_scholar_batch dois =
+  let url = "https://api.semanticscholar.org/graph/v1/paper/batch?fields=title,abstract" in
+  let fetch_chunk chunk =
+    let ids = List.map (fun doi -> `String ("DOI:" ^ doi)) chunk in
+    let body = Yojson.Basic.to_string (`Assoc ["ids", `List ids]) in
+    let rec attempt tries =
+      match http_request_status ~method_:"POST"
+        ~headers:(semantic_scholar_headers ())
+        ~content_type:"application/json" ~body url with
+      | status, response when status >= 200 && status < 300 -> Some response
+      | status, _ when (status = 429 || status = 403 || status >= 500) && tries > 0 ->
+          let delay = match tries with _ -> 15.0 in
+          Unix.sleepf delay;
+          attempt (tries - 1)
+      | _ -> None
+    in
+    match attempt 3 with
+    | None -> None
+    | Some response ->
+        (try
+           match Yojson.Basic.from_string response with
+           | `List items ->
+               let results =
+                 List.mapi (fun i item ->
+                   match List.nth_opt chunk i, item with
+                   | Some doi, `Assoc _ ->
+                       let abstract = json_string (json_field "abstract" item) in
+                       if String.trim abstract = "" then None
+                       else Some (doi, abstract)
+                   | _ -> None) items
+                 |> List.filter_map (fun x -> x) in
+               Some results
+           | _ -> None
+         with _ -> None)
+  in
+  let rec loop acc = function
+    | [] -> Some (List.concat (List.rev acc))
+    | chunk :: rest ->
+        (match fetch_chunk chunk with
+         | None -> None
+         | Some results ->
+             if rest <> [] then Unix.sleepf 3.0;
+             loop (results :: acc) rest)
+  in
+  match dois with
+  | [] -> Some []
+  | _ -> loop [] (list_chunks 500 dois)
+
 let openalex_abstract_of_item item =
   match json_field "abstract_inverted_index" item with
   | `Assoc entries ->
@@ -535,64 +602,166 @@ let acm_record doi =
       let abstract = match abstracts with x :: _ -> html_to_text x | [] -> "" in
       if abstract = "" then None else Some (abstract, "", "", "")
 
-let update_paper_metadata db id source abstract title authors year =
+(* Sources that are expected to carry the complete abstract.  Crossref and
+   OpenAlex metadata for ACM papers is sometimes truncated to the first
+   paragraph, so their text alone cannot be trusted as complete. *)
+let trusted_abstract_source = function
+  | "semantic_scholar" | "arxiv" | "acm" | "usenix_official" -> true
+  | _ -> false
+
+let is_acm_doi doi = starts_with doi "10.1145/"
+
+let apply_abstract db id ~existing ~existing_source ~source ~abstract ~status
+    ~title ~authors ~year =
   let stamp = sql_quote (now_iso ()) in
+  let same_text = String.trim abstract = String.trim existing in
+  let better_trusted_tie =
+    String.length abstract = String.length existing && not same_text &&
+    trusted_abstract_source source && not (trusted_abstract_source existing_source) in
+  (* Never replace a longer abstract with a shorter one. *)
+  let replace =
+    existing = "" || String.length abstract > String.length existing ||
+    better_trusted_tie in
+  let upgrade =
+    (not replace) && existing <> "" && same_text &&
+    trusted_abstract_source source && not (trusted_abstract_source existing_source) in
+  let write_source = replace || upgrade in
   exec db (Printf.sprintf
-    "UPDATE papers SET title=CASE WHEN %s='' THEN title ELSE %s END,authors=CASE WHEN %s='' THEN authors ELSE %s END,year=CASE WHEN year='' THEN %s ELSE year END,metadata_source=%s,metadata_updated_at=%s,abstract_en=CASE WHEN %s='' THEN abstract_en ELSE %s END,abstract_source=CASE WHEN %s='' THEN abstract_source ELSE %s END,abstract_fetched_at=%s,abstract_status=%s,abstract_error=NULL WHERE id=%s"
+    "UPDATE papers SET title=CASE WHEN %s='' THEN title ELSE %s END,authors=CASE WHEN %s='' THEN authors ELSE %s END,year=CASE WHEN year='' THEN %s ELSE year END,metadata_source=%s,metadata_updated_at=%s,abstract_en=CASE WHEN %b THEN %s ELSE abstract_en END,abstract_source=CASE WHEN %b THEN %s ELSE abstract_source END,abstract_ja=CASE WHEN %b THEN '' ELSE abstract_ja END,abstract_ja_source=CASE WHEN %b THEN NULL ELSE abstract_ja_source END,abstract_ja_at=CASE WHEN %b THEN NULL ELSE abstract_ja_at END,abstract_fetched_at=%s,abstract_status=%s,abstract_error=NULL WHERE id=%s"
     (sql_quote title) (sql_quote title) (sql_quote authors) (sql_quote authors)
     (sql_quote year) (sql_quote source) stamp
-    (sql_quote abstract) (sql_quote abstract) (sql_quote abstract) (sql_quote source)
-    stamp (sql_quote (if abstract = "" then "not_found" else "success")) (sql_quote id))
+    replace (sql_quote abstract) write_source (sql_quote source)
+    replace replace replace
+    stamp (sql_quote status) (sql_quote id))
 
-let fetch_abstracts ?(conference="") ?(year="") db =
-  let filters = [
-    "doi IS NOT NULL"; "doi<>''"; "abstract_en=''";
-    "abstract_status IN ('pending','error','not_found')" ] in
+let fetch_abstracts ?(conference="") ?(year="") ?(refresh=false) db =
+  let filters =
+    if refresh then [
+      "doi IS NOT NULL"; "doi<>''";
+      "(abstract_en='' OR abstract_status='partial' OR \
+       (substr(doi,1,8)='10.1145/' AND \
+        COALESCE(abstract_source,'') IN ('','crossref','openalex','openalex_title')))" ]
+    else [
+      "doi IS NOT NULL"; "doi<>''"; "abstract_en=''";
+      "abstract_status IN ('pending','error','not_found')" ] in
   let filters =
     if conference = "" then filters else filters @ ["conference=" ^ sql_quote conference] in
   let filters = if year = "" then filters else filters @ ["year=" ^ sql_quote year] in
   let where = String.concat " AND " filters in
   let stmt = Sqlite3.prepare db
-    ("SELECT id,doi,title FROM papers WHERE " ^ where ^ " ORDER BY conference,year,title") in
+    ("SELECT id,doi,title,abstract_en,COALESCE(abstract_source,''),COALESCE(abstract_status,'') \
+      FROM papers WHERE " ^ where ^ " ORDER BY conference,year,title") in
   let rec collect acc = match Sqlite3.step stmt with
-    | Sqlite3.Rc.ROW -> collect ((text_column stmt 0, text_column stmt 1, text_column stmt 2) :: acc)
+    | Sqlite3.Rc.ROW ->
+        collect ((text_column stmt 0, text_column stmt 1, text_column stmt 2,
+                  text_column stmt 3, text_column stmt 4, text_column stmt 5) :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
     | rc -> check_rc "Selecting papers to fetch" rc; List.rev acc
   in
   let rows = collect [] in
   ignore (Sqlite3.finalize stmt);
+  (* One batch request covers every ACM paper in the selected scope, which
+     keeps us well inside the Semantic Scholar rate limit. *)
+  let acm_dois =
+    List.filter_map (fun (_, doi, _, _, _, _) ->
+      if is_acm_doi doi then Some doi else None) rows in
+  let s2_lookup, s2_batch_ok =
+    match semantic_scholar_batch acm_dois with
+    | Some results -> (results, true)
+    | None ->
+        if acm_dois <> [] then
+          Printf.printf
+            "Semantic Scholar batch unavailable; ACM abstracts may be marked partial.\n%!";
+        ([], false) in
   let ok = ref 0 and missing = ref 0 in
-  List.iter (fun (id, doi, paper_title) ->
+  List.iter (fun (id, doi, paper_title, existing, existing_source, _existing_status) ->
     Printf.printf "Fetching %s ... %!" doi;
-    let crossref = crossref_record doi in
+    let acm = is_acm_doi doi in
+    let crossref =
+      if acm && existing <> "" then None else crossref_record doi in
+    let mt, ma, my =
+      match crossref with
+      | Some (_, t, a, y) -> (t, a, y)
+      | None -> ("", "", "") in
     let result =
-      let candidates = [
-        ("crossref", (fun () -> crossref));
-        ("openalex", (fun () -> openalex_record doi));
-        ("openalex_title", (fun () -> openalex_title_record paper_title));
-        ("arxiv", (fun () -> arxiv_record paper_title));
-        ("semantic_scholar", (fun () -> semantic_scholar_record doi));
-        ("acm", (fun () -> acm_record doi))
-      ] in
-      let rec choose = function
-        | [] -> None
-        | (source, fetch) :: rest ->
-            (match fetch () with
-             | Some (abstract, title, authors, year) when abstract <> "" ->
-                 let fallback = match crossref with Some (_, t, a, y) -> (t,a,y) | None -> ("","","") in
-                 let ft, fa, fy = fallback in
-                 Some (source, strip_abstract_label abstract,
-                   (if title <> "" then title else ft),
-                   (if authors <> "" then authors else fa),
-                   (if year <> "" then year else fy))
-             | _ -> choose rest)
-      in
-      choose candidates
+      if acm then (
+        let candidates = ref [] in
+        let add source abstract =
+          let abstract = strip_abstract_label abstract in
+          if String.trim abstract <> "" then
+            candidates := (source, abstract) :: !candidates in
+        if existing <> "" then add existing_source existing;
+        (match crossref with Some (a, _, _, _) -> add "crossref" a | None -> ());
+        if existing = "" then
+          (match openalex_record doi with
+           | Some (a, _, _, _) -> add "openalex" a
+           | None -> ());
+        let s2_abstract = List.assoc_opt doi s2_lookup in
+        (match s2_abstract with
+         | Some abstract -> add "semantic_scholar" abstract
+         | None -> ());
+        (* Only consult the slower fallbacks when Semantic Scholar replied
+           and had no abstract for this paper, or when we have no abstract at
+           all.  A failed batch would otherwise trigger three requests per
+           paper for the whole scope. *)
+        if s2_abstract = None && (existing = "" || s2_batch_ok) then (
+          (match openalex_title_record paper_title with
+           | Some (a, _, _, _) -> add "openalex_title" a
+           | None -> ());
+          (match arxiv_record paper_title with
+           | Some (a, _, _, _) -> add "arxiv" a
+           | None -> ());
+          (match acm_record doi with
+           | Some (a, _, _, _) -> add "acm" a
+           | None -> ()));
+        let best =
+          List.fold_left (fun best (source, abstract) ->
+            match best with
+            | None -> Some (source, abstract)
+            | Some (best_source, best_abstract) ->
+                let better =
+                  String.length abstract > String.length best_abstract ||
+                  (String.length abstract = String.length best_abstract &&
+                   trusted_abstract_source source &&
+                   not (trusted_abstract_source best_source)) in
+                if better then Some (source, abstract) else best)
+            None !candidates in
+        match best with
+        | None -> None
+        | Some (source, abstract) ->
+            let status =
+              if trusted_abstract_source source then "success" else "partial" in
+            Some (source, abstract, status, mt, ma, my)
+      ) else (
+        let ft, fa, fy = (mt, ma, my) in
+        let rec choose = function
+          | [] -> None
+          | (source, fetch) :: rest ->
+              (match fetch () with
+               | Some (abstract, title, authors, year) when String.trim abstract <> "" ->
+                   let abstract = strip_abstract_label abstract in
+                   Some (source, abstract, "success",
+                         (if title <> "" then title else ft),
+                         (if authors <> "" then authors else fa),
+                         (if year <> "" then year else fy))
+               | _ -> choose rest)
+        in
+        choose [
+          ("crossref", (fun () -> crossref));
+          ("openalex", (fun () -> openalex_record doi));
+          ("openalex_title", (fun () -> openalex_title_record paper_title));
+          ("arxiv", (fun () -> arxiv_record paper_title));
+          ("semantic_scholar", (fun () -> semantic_scholar_record doi));
+          ("acm", (fun () -> acm_record doi))
+        ])
     in
     match result with
-    | Some (source, abstract, title, authors, year) ->
-        update_paper_metadata db id source abstract title authors year;
-        incr ok; Printf.printf " %s (%d chars)\n%!" source (String.length abstract)
+    | Some (source, abstract, status, title, authors, year) ->
+        apply_abstract db id ~existing ~existing_source ~source ~abstract ~status
+          ~title ~authors ~year;
+        incr ok;
+        Printf.printf " %s (%d chars)%s\n%!" source (String.length abstract)
+          (if status = "partial" then " [may be partial]" else "")
     | None ->
         exec db (Printf.sprintf "UPDATE papers SET abstract_status='not_found',abstract_fetched_at=%s,abstract_error='No abstract returned by Crossref, OpenAlex, arXiv, Semantic Scholar, or ACM' WHERE id=%s"
           (sql_quote (now_iso ())) (sql_quote id));
@@ -1968,7 +2137,10 @@ let render papers selected show_japanese abstract_scroll notice =
   let count = List.length papers in
   let keeps = List.fold_left (fun n p -> if p.decision = Keep then n + 1 else n) 0 papers in
   let unread = List.fold_left (fun n p -> if not p.reviewed && p.decision = Undecided then n + 1 else n) 0 papers in
-  Printf.printf " PIWANA  |  %d papers  |  %d unread  |  %d keep\n" count unread keeps;
+  let partials = List.fold_left (fun n p -> if p.abstract_status = "partial" then n + 1 else n) 0 papers in
+  Printf.printf " PIWANA  |  %d papers  |  %d unread  |  %d keep" count unread keeps;
+  if partials > 0 then Printf.printf "  |  partial abstracts: %d" partials;
+  print_newline ();
   print_endline (String.make (min width 100) '-');
   print_endline " j/k: paper  r: read  s: keep  x: skip  u: reset  t: translation  [/]: abstract page  q: quit";
   print_endline (String.make (min width 100) '-');
@@ -1990,6 +2162,8 @@ let render papers selected show_japanese abstract_scroll notice =
       Printf.printf "DOI: %s\n" (if p.doi = "" then "(none)" else p.doi);
       Printf.printf "Authors: %s\n" (truncate width p.authors);
       Printf.printf "Abstract source: %s\n" (if p.abstract_source = "" then "not available" else p.abstract_source);
+      if p.abstract_status = "partial" then
+        print_endline "Abstract may be partial: no trusted source confirmed the full text.";
       if p.abstract_ja_source <> "" then
         Printf.printf "Translation source: %s\n" p.abstract_ja_source;
       print_endline "ABSTRACT";
@@ -1999,6 +2173,7 @@ let render papers selected show_japanese abstract_scroll notice =
       let lines = wrap_text (width - 2) abstract in
       let reserved = 13 + (last - first) + (if count > list_rows then 1 else 0)
                      + (if p.abstract_ja_source <> "" then 1 else 0)
+                     + (if p.abstract_status = "partial" then 1 else 0)
                      + (if notice = "" then 0 else 1) in
       let visible = max 4 (height - reserved) in
       let max_scroll = max 0 (List.length lines - visible) in
@@ -2024,9 +2199,17 @@ let main () =
       import_dois db Sys.argv.(2); ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--fetch-abstracts" then (
-      let conference = if Array.length Sys.argv > 2 then String.uppercase_ascii Sys.argv.(2) else "" in
-      let year = if Array.length Sys.argv > 3 then Sys.argv.(3) else "" in
-      fetch_abstracts ~conference ~year db; ignore (Sqlite3.db_close db); exit 0
+      let args = Array.to_list Sys.argv |> List.tl |> List.tl in
+      let refresh = List.mem "--refresh" args in
+      let positional = List.filter (fun arg -> arg <> "--refresh") args in
+      let conference = match positional with
+        | value :: _ -> String.uppercase_ascii value
+        | [] -> "" in
+      let conference = if conference = "ALL" then "" else conference in
+      let year = match positional with
+        | _ :: value :: _ -> value
+        | _ -> "" in
+      fetch_abstracts ~conference ~year ~refresh db; ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--translate" then (
       let args = Array.to_list Sys.argv |> List.tl |> List.tl in

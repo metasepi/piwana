@@ -180,15 +180,17 @@ DOI discovery now follows the publisher edition:
 ```sh
 dune exec ./bin/piwana.exe -- --fetch-abstracts
 dune exec ./bin/piwana.exe -- --fetch-abstracts SOSP 2026
+dune exec ./bin/piwana.exe -- --fetch-abstracts SOSP 2026 --refresh
 ```
 
-The fetcher tries these sources in order until it finds a non-empty abstract:
+The fetcher uses the sources below. ACM papers keep the longest abstract found;
+other papers stop at the first non-empty result:
 
 1. Crossref DOI metadata
 2. OpenAlex DOI metadata
-3. OpenAlex exact-title search (preprint/arXiv record)
-4. arXiv exact-title search
-5. Semantic Scholar DOI metadata
+3. Semantic Scholar batch lookup (ACM DOIs; one request for up to 500 papers)
+4. OpenAlex exact-title search (preprint/arXiv record)
+5. arXiv exact-title search
 6. ACM Digital Library HTML metadata
 
 OpenAlex abstracts are reconstructed from `abstract_inverted_index`. The
@@ -204,7 +206,32 @@ export SEMANTIC_SCHOLAR_API_KEY=your-key
 # or: export S2_API_KEY=your-key
 ```
 
-Retrieval stops at the first non-empty abstract and does not download PDFs.
+### Partial abstracts
+
+Crossref and OpenAlex metadata for ACM papers is sometimes truncated to the
+first paragraph even though the full abstract exists. The fetcher therefore
+treats `10.1145/` papers specially:
+
+- `semantic_scholar`, `arxiv`, `acm`, and `usenix_official` are trusted to
+  contain the complete abstract.
+- `crossref`, `openalex`, and `openalex_title` are treated as suspect for ACM
+  papers. If the longest available text still comes from one of them, the
+  paper is stored with `abstract_status='partial'`.
+- The TUI header shows the number of partial abstracts, and the detail pane
+  shows `Abstract may be partial: no trusted source confirmed the full text.`
+- An existing abstract is never replaced by a shorter one. When a longer
+  abstract is found, its Japanese translation is cleared so the next
+  `--translate` run uses the new text.
+
+This relies on detection rather than a length threshold: a short abstract may
+be complete, and a long one may still be truncated. Without an API key the
+Semantic Scholar batch endpoint can return HTTP 429; when that happens the ACM
+papers are left unchanged and marked `partial`, and a later `--refresh` retries
+them.
+
+`--refresh` rechecks papers whose abstract is missing or marked `partial`, plus
+ACM papers whose text came from Crossref, OpenAlex, or the OpenAlex title
+search. It is safe to re-run. Retrieval does not download PDFs.
 
 Accessible author pages or publisher pages found by a general web search may
 still have an abstract that these sources lack. Such manual retrieval is not
@@ -212,9 +239,9 @@ automatic; add the text to `abstract_en` in SQLite if you need it. The bundled
 collectors intentionally avoid scraping arbitrary search-engine results.
 
 The `papers` table records `abstract_source`, `abstract_fetched_at`, and
-`abstract_status` (`pending`, `success`, or `not_found`). Records without an
-abstract remain visible and are not treated as successful. Papers marked
-`not_found` are retried by the next explicit `--fetch-abstracts` run.
+`abstract_status` (`pending`, `success`, `partial`, or `not_found`). Records
+without an abstract remain visible and are not treated as successful. Papers
+marked `not_found` are retried by the next explicit `--fetch-abstracts` run.
 
 ## Japanese translation
 
