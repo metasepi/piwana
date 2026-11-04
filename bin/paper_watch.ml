@@ -72,7 +72,24 @@ let init_schema db =
       CHECK (decision IN ('undecided','keep','skip')), updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\
   )";
   exec db "CREATE INDEX IF NOT EXISTS papers_conference_year_idx ON papers(conference, year)";
-  exec db "CREATE INDEX IF NOT EXISTS reviews_decision_idx ON reviews(decision, reviewed_at)"
+  exec db "CREATE INDEX IF NOT EXISTS reviews_decision_idx ON reviews(decision, reviewed_at)";
+  let ensure_column name definition =
+    let stmt = Sqlite3.prepare db "PRAGMA table_info(papers)" in
+    let rec has_column () = match Sqlite3.step stmt with
+      | Sqlite3.Rc.ROW ->
+          let found = match Sqlite3.column stmt 1 with
+            | Sqlite3.Data.TEXT s -> s = name
+            | _ -> false
+          in found || has_column ()
+      | _ -> false
+    in
+    let exists = has_column () in
+    ignore (Sqlite3.finalize stmt);
+    if not exists then exec db ("ALTER TABLE papers ADD COLUMN " ^ name ^ " " ^ definition)
+  in
+  ensure_column "abstract_fetched_at" "TEXT";
+  ensure_column "abstract_status" "TEXT NOT NULL DEFAULT 'pending'";
+  ensure_column "abstract_error" "TEXT"
 
 let scalar_int db sql =
   let stmt = Sqlite3.prepare db sql in
@@ -177,6 +194,168 @@ let save_state db p =
      ON CONFLICT(paper_id) DO UPDATE SET reviewed_at=excluded.reviewed_at,decision=excluded.decision,updated_at=CURRENT_TIMESTAMP"
     (sql_quote p.id) reviewed_at (sql_quote (string_of_decision p.decision)))
 
+let shell_quote s = "'" ^ String.concat "'\\''" (String.split_on_char '\'' s) ^ "'"
+
+let percent_encode_path s =
+  let b = Buffer.create (String.length s) in
+  String.iter (fun c ->
+    match c with
+    | 'a'..'z' | 'A'..'Z' | '0'..'9' | '-' | '_' | '.' | '~' | '/' -> Buffer.add_char b c
+    | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
+  Buffer.contents b
+
+let http_get url =
+  let command = "curl -fsSL --connect-timeout 8 --max-time 25 -H " ^
+    shell_quote "Accept: application/json" ^ " " ^ shell_quote url ^ " 2>/dev/null" in
+  let ic = Unix.open_process_in command in
+  let contents =
+    let b = Buffer.create 4096 in
+    (try while true do Buffer.add_string b (input_line ic); Buffer.add_char b '\n' done with End_of_file -> ());
+    Buffer.contents b
+  in
+  match Unix.close_process_in ic with
+  | Unix.WEXITED 0 -> Some contents
+  | _ -> None
+
+let json_field key = function
+  | `Assoc fields -> (try List.assoc key fields with Not_found -> `Null)
+  | _ -> `Null
+
+let json_string = function
+  | `String s -> s
+  | `Int n -> string_of_int n
+  | _ -> ""
+
+let json_year = function
+  | `Assoc _ as obj ->
+      (match json_field "date-parts" obj with
+       | `List (`List (`Int y :: _) :: _) -> string_of_int y
+       | _ -> "")
+  | _ -> ""
+
+let html_to_text s =
+  let b = Buffer.create (String.length s) in
+  let in_tag = ref false in
+  String.iter (fun c ->
+    if c = '<' then in_tag := true
+    else if c = '>' then (in_tag := false; Buffer.add_char b ' ')
+    else if not !in_tag then Buffer.add_char b c) s;
+  let s = Buffer.contents b in
+  let replacements = ["&amp;", "&"; "&lt;", "<"; "&gt;", ">"; "&quot;", "\""; "&#39;", "'"] in
+  let replace_all input oldv newv =
+    let old_len = String.length oldv in
+    let b = Buffer.create (String.length input) in
+    let rec loop i =
+      if i >= String.length input then ()
+      else if i + old_len <= String.length input && String.sub input i old_len = oldv then
+        (Buffer.add_string b newv; loop (i + old_len))
+      else (Buffer.add_char b input.[i]; loop (i + 1))
+    in loop 0; Buffer.contents b
+  in
+  let s = List.fold_left (fun acc (a,b) -> replace_all acc a b) s replacements in
+  String.trim s
+
+let crossref_record doi =
+  let url = "https://api.crossref.org/works/" ^ percent_encode_path doi in
+  match http_get url with
+  | None -> None
+  | Some body ->
+      (try
+        let root = Yojson.Basic.from_string body in
+        let msg = json_field "message" root in
+        let abstract = html_to_text (json_string (json_field "abstract" msg)) in
+        let title = match json_field "title" msg with `List (`String x :: _) -> x | _ -> "" in
+        let authors = match json_field "author" msg with
+          | `List xs -> String.concat ", " (List.filter ((<>) "") (List.map (fun a ->
+              let given = json_string (json_field "given" a) in
+              let family = json_string (json_field "family" a) in
+              String.trim (given ^ " " ^ family)) xs))
+          | _ -> "" in
+        let year = let y = json_year (json_field "published-print" msg) in
+          if y <> "" then y else json_year (json_field "published-online" msg) in
+        Some (abstract, title, authors, year)
+       with _ -> None)
+
+let semantic_scholar_record doi =
+  let paper_id = "DOI:" ^ doi in
+  let url = "https://api.semanticscholar.org/graph/v1/paper/" ^
+    percent_encode_path paper_id ^ "?fields=title,abstract,authors,year" in
+  match http_get url with
+  | None -> None
+  | Some body ->
+      (try
+        let obj = Yojson.Basic.from_string body in
+        let abstract = json_string (json_field "abstract" obj) in
+        let title = json_string (json_field "title" obj) in
+        let authors = match json_field "authors" obj with
+          | `List xs -> String.concat ", " (List.filter ((<>) "") (List.map (fun a -> json_string (json_field "name" a)) xs))
+          | _ -> "" in
+        let year = json_string (json_field "year" obj) in
+        Some (abstract, title, authors, year)
+       with _ -> None)
+
+let update_paper_metadata db id source abstract title authors year =
+  let stamp = sql_quote (now_iso ()) in
+  exec db (Printf.sprintf
+    "UPDATE papers SET title=CASE WHEN %s='' THEN title ELSE %s END,authors=CASE WHEN %s='' THEN authors ELSE %s END,year=CASE WHEN %s='' THEN year ELSE %s END,metadata_source=%s,metadata_updated_at=%s,abstract_en=CASE WHEN %s='' THEN abstract_en ELSE %s END,abstract_source=CASE WHEN %s='' THEN abstract_source ELSE %s END,abstract_fetched_at=%s,abstract_status=%s,abstract_error=NULL WHERE id=%s"
+    (sql_quote title) (sql_quote title) (sql_quote authors) (sql_quote authors)
+    (sql_quote year) (sql_quote year) (sql_quote source) stamp
+    (sql_quote abstract) (sql_quote abstract) (sql_quote abstract) (sql_quote source)
+    stamp (sql_quote (if abstract = "" then "not_found" else "success")) (sql_quote id))
+
+let fetch_abstracts db =
+  let stmt = Sqlite3.prepare db
+    "SELECT id,doi FROM papers WHERE doi IS NOT NULL AND doi<>'' AND abstract_en='' AND abstract_status IN ('pending','error','not_found') ORDER BY conference,year,title" in
+  let rec collect acc = match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW -> collect ((text_column stmt 0, text_column stmt 1) :: acc)
+    | Sqlite3.Rc.DONE -> List.rev acc
+    | rc -> check_rc "Selecting papers to fetch" rc; List.rev acc
+  in
+  let rows = collect [] in
+  ignore (Sqlite3.finalize stmt);
+  let ok = ref 0 and missing = ref 0 in
+  List.iter (fun (id, doi) ->
+    Printf.printf "Fetching %s ... %!" doi;
+    let result =
+      match crossref_record doi with
+      | Some (abstract, title, authors, year) when abstract <> "" -> Some ("crossref", abstract, title, authors, year)
+      | crossref ->
+          (match semantic_scholar_record doi with
+           | Some (abstract, title, authors, year) when abstract <> "" -> Some ("semantic_scholar", abstract,
+               (if title <> "" then title else match crossref with Some (_,t,_,_) -> t | _ -> ""),
+               (if authors <> "" then authors else match crossref with Some (_,_,a,_) -> a | _ -> ""),
+               (if year <> "" then year else match crossref with Some (_,_,_,y) -> y | _ -> ""))
+           | _ -> None)
+    in
+    match result with
+    | Some (source, abstract, title, authors, year) ->
+        update_paper_metadata db id source abstract title authors year;
+        incr ok; Printf.printf " %s (%d chars)\n%!" source (String.length abstract)
+    | None ->
+        exec db (Printf.sprintf "UPDATE papers SET abstract_status='not_found',abstract_fetched_at=%s,abstract_error='No abstract returned by Crossref or Semantic Scholar' WHERE id=%s"
+          (sql_quote (now_iso ())) (sql_quote id));
+        incr missing; print_endline " not found"
+  ) rows;
+  Printf.printf "Abstract fetch complete: %d fetched, %d unavailable, %d checked.\n%!" !ok !missing (List.length rows)
+
+let import_dois db path =
+  let ic = open_in path in
+  let added = ref 0 in
+  (try while true do
+    let line = String.trim (input_line ic) in
+    if line <> "" && line.[0] <> '#' then (
+      let doi = if String.length line >= 16 && String.sub line 0 16 = "https://doi.org/" then String.sub line 16 (String.length line - 16) else line in
+      let id = "doi:" ^ doi in
+      exec db (Printf.sprintf
+        "INSERT OR IGNORE INTO papers(id,doi,title,authors,conference,year,abstract_status) VALUES(%s,%s,%s,'','','','pending')"
+        (sql_quote id) (sql_quote doi) (sql_quote ("[Metadata pending] " ^ doi)));
+      let inserted = Sqlite3.changes db > 0 in
+      exec db (Printf.sprintf "INSERT OR IGNORE INTO reviews(paper_id) VALUES(%s)" (sql_quote id));
+      if inserted then incr added
+    )
+  done with End_of_file -> close_in ic);
+  Printf.printf "Imported %d DOI(s) from %s.\n%!" !added path
+
 let status_label p =
   match p.reviewed, p.decision with
   | false, Undecided -> "UNREAD"
@@ -239,12 +418,19 @@ let set_state db p reviewed decision =
   p.reviewed <- reviewed; p.decision <- decision; save_state db p
 
 let main () =
-  let tsv_path = if Array.length Sys.argv > 1 then Sys.argv.(1) else "papers.tsv" in
   let db_path = default_db_path () in
   mkdir_p (Filename.dirname db_path);
   let db = Sqlite3.db_open db_path in
   try
     init_schema db;
+    let command = if Array.length Sys.argv > 1 then Sys.argv.(1) else "" in
+    if command = "--import-dois" && Array.length Sys.argv > 2 then (
+      import_dois db Sys.argv.(2); ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--fetch-abstracts" then (
+      fetch_abstracts db; ignore (Sqlite3.db_close db); exit 0
+    );
+    let tsv_path = if command <> "" && command.[0] <> '-' then command else "papers.tsv" in
     ensure_seed_data db tsv_path;
     let papers = load_papers db in
     if papers = [] then (prerr_endline "No papers in database. Provide a TSV file on first run."; ignore (Sqlite3.db_close db); exit 0);

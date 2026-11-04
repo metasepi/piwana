@@ -6,5 +6,6 @@ depends: [
   "ocaml" {>= "4.13"}
   "dune" {>= "3.0"}
   "sqlite3"
+  "yojson"
 ]
 build: [ ["dune" "build" "-p" name "-j" jobs] ]

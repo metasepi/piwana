@@ -1,17 +1,14 @@
-# paper-watch TUI (SQLite edition)
+# paper-watch TUI (SQLite + DOI Abstract Fetch)
 
-A small terminal UI for reviewing papers. This version keeps the original keyboard-driven UI and stores bibliographic data and review decisions in SQLite.
+A small OCaml terminal application for reviewing papers. Review state is stored in SQLite.
 
-## Requirements
+## Dependencies
 
-- OCaml >= 4.13
-- Dune >= 3.0
-- SQLite development library and the OCaml `sqlite3` package
-
-Install the OCaml dependency with:
+On Debian/Ubuntu:
 
 ```sh
-opam install dune sqlite3
+sudo apt install libsqlite3-dev curl
+opam install dune sqlite3 yojson
 ```
 
 ## Build and run
@@ -21,43 +18,51 @@ dune build
 dune exec ./bin/paper_watch.exe
 ```
 
-On the first run, `papers.tsv` in the current directory is imported if the database is empty. The TSV format remains:
+The database defaults to `~/.local/state/paper-watch/papers.sqlite3`.
+Set `PAPER_WATCH_DB` to use another database path.
+
+On first run, `papers.tsv` is imported if the database is empty. The bundled TSV contains **fictional UI sample records** with placeholder DOIs (`10.0000/...`); they are not real papers and cannot be used to test metadata retrieval.
+
+## Import real DOIs
+
+Create a text file with one DOI per line. A `https://doi.org/` URL is also accepted. Blank lines and lines beginning with `#` are ignored.
+
+Example `dois.txt`:
 
 ```text
-id<TAB>title<TAB>authors<TAB>conference<TAB>year<TAB>abstract_en<TAB>abstract_ja
+10.xxxx/example-one
+10.xxxx/example-two
+https://doi.org/10.xxxx/example-three
 ```
 
-The database is created at:
+Import them into the current SQLite database:
 
-```text
-~/.local/state/paper-watch/papers.sqlite3
+```sh
+dune exec ./bin/paper_watch.exe -- --import-dois dois.txt
 ```
 
-Override the database location with `PAPER_WATCH_DB=/path/to/papers.sqlite3`. If the old `reviews.tsv` state file exists, its states are migrated on the first TSV import. The old `PAPER_WATCH_STATE` environment variable controls that legacy file's path.
+Then retrieve abstracts:
 
-## Keys
+```sh
+dune exec ./bin/paper_watch.exe -- --fetch-abstracts
+```
+
+The fetcher tries Crossref first and Semantic Scholar if Crossref has no abstract. When metadata is returned, title, authors, and year are also populated where available. It does not download PDFs.
+
+The `papers` table records `abstract_source`, `abstract_fetched_at`, and `abstract_status` (`pending`, `success`, or `not_found`). Existing databases are migrated automatically when the application starts. Records without an abstract remain visible and are not silently treated as successful.
+
+The fetch command only retries records with an empty abstract and status `pending` or `error`. A `not_found` result is retained to avoid repeatedly querying providers; edit its status to `pending` in SQLite if you want to retry later.
+
+## TUI keys
 
 - `j` / `k`: move down / up
-- `r`: mark as read (decision remains undecided)
+- `r`: mark read (Undecided)
 - `s`: Keep
 - `x`: Skip
-- `u`: reset to unread / undecided
+- `u`: reset to unread
 - `t`: toggle English / Japanese abstract
 - `q`: quit
 
-## Database model
+## Scope and limitations
 
-- `papers`: bibliographic metadata, DOI, English/Japanese abstract, and metadata provenance fields
-- `reviews`: review timestamp and decision, keyed by `paper_id`
-
-Review state is deliberately separate from bibliographic metadata. Future metadata refreshes can update titles and abstracts without overwriting Keep/Skip decisions. DOI has a UNIQUE constraint to support deduplication when real conference records are imported.
-
-Useful inspection commands:
-
-```sh
-sqlite3 ~/.local/state/paper-watch/papers.sqlite3 '.schema'
-sqlite3 ~/.local/state/paper-watch/papers.sqlite3 'select conference, year, count(*) from papers group by conference, year;'
-sqlite3 ~/.local/state/paper-watch/papers.sqlite3 'select p.title, r.decision from papers p join reviews r on r.paper_id=p.id;'
-```
-
-The five current sample records are illustrative placeholders, not real papers. Live metadata collection is the next step.
+This is an initial DOI-to-abstract retrieval path, not the full proceedings collector. Coverage depends on whether the metadata providers have an abstract for a DOI. The next step is to test with several real DOI records and compare the results against the publishers' official proceedings. The current implementation uses the `curl` executable for HTTPS requests.
