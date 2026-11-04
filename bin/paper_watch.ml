@@ -454,47 +454,52 @@ let attr_value tag name =
   try ignore (Str.search_forward re tag 0); Str.matched_group 1 tag with _ -> ""
 
 let parse_usenix_papers html =
-  (* Locate each heading explicitly; avoid a greedy expression spanning multiple h2 blocks. *)
+  (* Keep the opening position as well as the end of each heading.  The
+     following section must start at the NEXT heading's opening tag, not
+     after that heading; otherwise its title is appended to this abstract. *)
   let rec headings pos acc =
     try
-      ignore (Str.search_forward (Str.regexp_case_fold "<h2[^>]*>") html pos);
+      let heading_start = Str.search_forward (Str.regexp_case_fold "<h2[^>]*>") html pos in
       let open_end = Str.match_end () in
       let close = Str.search_forward (Str.regexp_case_fold "</h2>") html open_end in
       let heading = String.sub html open_end (close-open_end) in
-      let end_pos = Str.match_end () in
+      let body_start = Str.match_end () in
       let anchor_re = Str.regexp_case_fold "<a[^>]*>\\([^<]*\\)</a>" in
       let href_re = Str.regexp_case_fold "<a[^>]*>" in
       let title = try ignore (Str.search_forward anchor_re heading 0); Str.matched_group 1 heading |> strip_html with _ -> "" in
       let href = try ignore (Str.search_forward href_re heading 0); attr_value (Str.matched_string heading) "href" with _ -> "" in
-      let acc = if title <> "" && href <> "" && String.length href > 0 then (end_pos,title,href)::acc else acc in
-      headings end_pos acc
+      let is_presentation =
+        try ignore (Str.search_forward (Str.regexp_string "/presentation/") href 0); true
+        with Not_found -> false
+      in
+      let acc = if title <> "" && is_presentation then (heading_start,body_start,title,href)::acc else acc in
+      headings body_start acc
     with Not_found -> List.rev acc
   in
   let hs = headings 0 [] in
   let rec make = function
     | [] -> []
-    | (body_start,title,href)::rest ->
-        let body_end = match rest with (next,_,_)::_ -> next | [] -> String.length html in
+    | (_,body_start,title,href)::rest ->
+        let body_end = match rest with (next_heading,_,_,_)::_ -> next_heading | [] -> String.length html in
         let body = String.sub html body_start (max 0 (body_end-body_start)) |> strip_html in
-        let tokens = String.split_on_char ' ' body |> List.filter ((<>) "") in
-        let authors = match tokens with
-          | [] -> ""
-          | _ ->
-              (* The author block precedes the first "Available Media" marker. *)
-              let re = Str.regexp_case_fold "Available Media" in
-              (try let i = Str.search_forward re body 0 in String.sub body 0 i |> String.trim
-               with Not_found -> "")
+        let available = Str.regexp_case_fold "Available Media" in
+        let authors =
+          try
+            let i = Str.search_forward available body 0 in
+            let prefix = String.sub body 0 i |> String.trim in
+            Str.global_replace (Str.regexp_case_fold "Operational Systems Paper[ \\t]*$") "" prefix |> String.trim
+          with Not_found -> ""
         in
         let abstract =
-          let re = Str.regexp_case_fold "Available Media" in
-          try ignore (Str.search_forward re body 0);
+          try
+            ignore (Str.search_forward available body 0);
             let tail = String.sub body (Str.match_end ()) (String.length body - Str.match_end ()) |> String.trim in
-            let tail = Str.global_replace (Str.regexp "^Operational Systems Paper[ \t]*") "" tail in
-            tail
+            let tail = Str.global_replace (Str.regexp "^Operational Systems Paper[ \\t]*") "" tail in
+            String.trim tail
           with Not_found -> ""
         in
         let absolute = if String.length href > 0 && href.[0] = '/' then "https://www.usenix.org" ^ href else href in
-        (title, String.trim authors, abstract, absolute) :: make rest
+        (title, authors, abstract, absolute) :: make rest
   in
   make hs
 
