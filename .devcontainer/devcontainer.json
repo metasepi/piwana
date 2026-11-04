@@ -1,0 +1,30 @@
+{
+  "image": "cuihtlauac/ocaml-devcontainer:latest",
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ocamllabs.ocaml-platform",
+        "ms-vscode.makefile-tools"
+      ]
+    }
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/claude/dot.claude,target=/home/vscode/.claude,type=bind",
+    "source=${localEnv:HOME}/claude/per-clone/${localWorkspaceFolderBasename}/dot.claude.json,target=/home/vscode/.claude.json,type=bind",
+    "source=${localEnv:HOME}/codex/dot.codex,target=/home/vscode/.codex,type=bind",
+    "source=${localEnv:HOME}/opencode/dot.share,target=/home/vscode/.local/share/opencode,type=bind",
+    "source=${localEnv:HOME}/opencode/dot.state,target=/home/vscode/.local/state/opencode,type=bind",
+    "source=${localEnv:HOME}/github/dot.copilot,target=/home/vscode/.copilot,type=bind",
+    "source=${localEnv:HOME}/github/dot.config-gh-metasepi,target=/home/vscode/.config/gh,type=bind"
+  ],
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude && sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep time libsqlite3-dev curl && sudo npm install -g @openai/codex && sudo npm install -g @opencode/cli && opam update && opam install -y dune sqlite3 yojson && gh auth setup-git && git config --global url.https://github.com/.insteadOf git@github.com: && git config rerere.enabled true && git config pull.rebase merges",
+  "containerEnv": {
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "OPAMYES": "true"
+  }
+}
