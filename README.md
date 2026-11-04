@@ -1,6 +1,7 @@
-# piwana TUI (SQLite + DOI Abstract Fetch)
+# piwana TUI (SQLite + proceedings collection + DOI abstracts)
 
-A small OCaml terminal application for reviewing papers. Review state is stored in SQLite.
+A small OCaml terminal application for reviewing conference papers. Review
+state, paper metadata, DOI candidates, and abstracts are stored in SQLite.
 
 ## Dependencies
 
@@ -8,7 +9,7 @@ On Debian/Ubuntu:
 
 ```sh
 sudo apt install libsqlite3-dev curl
-opam install dune sqlite3 yojson
+opam install dune sqlite3 yojson str
 ```
 
 ## Build and run
@@ -21,37 +22,169 @@ dune exec ./bin/piwana.exe
 The database defaults to `~/.local/state/piwana/papers.sqlite3`.
 Set `PIWANA_DB` to use another database path.
 
-On first run, `papers.tsv` is imported if the database is empty. The bundled TSV contains **fictional UI sample records** with placeholder DOIs (`10.0000/...`); they are not real papers and cannot be used to test metadata retrieval.
+On first run, `papers.tsv` is imported if the database is empty. The bundled
+TSV contains **fictional UI sample records** with placeholder DOIs
+(`10.0000/...`); they are not real papers and cannot be used to test metadata
+retrieval.
 
-## Import real DOIs
+## Import individual DOIs
 
-Create a text file with one DOI per line. A `https://doi.org/` URL is also accepted. Blank lines and lines beginning with `#` are ignored.
-
-Example `dois.txt`:
-
-```text
-10.xxxx/example-one
-10.xxxx/example-two
-https://doi.org/10.xxxx/example-three
-```
-
-Import them into the current SQLite database:
+Create a text file with one DOI per line. A `https://doi.org/` URL is also
+accepted. Blank lines and lines beginning with `#` are ignored.
 
 ```sh
 dune exec ./bin/piwana.exe -- --import-dois dois.txt
-```
-
-Then retrieve abstracts:
-
-```sh
 dune exec ./bin/piwana.exe -- --fetch-abstracts
 ```
 
-The fetcher tries Crossref first and Semantic Scholar if Crossref has no abstract. When metadata is returned, title, authors, and year are also populated where available. It does not download PDFs.
+## Supported conferences
 
-The `papers` table records `abstract_source`, `abstract_fetched_at`, and `abstract_status` (`pending`, `success`, or `not_found`). Existing databases are migrated automatically when the application starts. Records without an abstract remain visible and are not silently treated as successful.
+The collectors currently cover the following editions. The same commands work
+for 2025 and 2026 unless noted.
 
-The fetch command only retries records with an empty abstract and status `pending` or `error`. A `not_found` result is retained to avoid repeatedly querying providers; edit its status to `pending` in SQLite if you want to retry later.
+| Conference | Publisher / index | How the edition is identified | DOI |
+| --- | --- | --- | --- |
+| OSDI | USENIX | official Technical Sessions page | none (USENIX does not expose DOI identifiers) |
+| SOSP | ACM | ACM DL proceedings / Crossref | yes |
+| ASPLOS | ACM | 2–3 proceedings volumes | yes |
+| POPL | ACM PACMPL | PACMPL issue `POPL` | yes |
+| PLDI | ACM PACMPL | PACMPL issue `PLDI` | yes |
+| CPP | ACM | ACM DL proceedings / Crossref | yes |
+| CAV | Springer LNCS | Springer book volumes | yes |
+
+Verified article counts at the time of writing:
+
+| Edition | Articles |
+| --- | ---: |
+| OSDI 2026 | 136 |
+| SOSP 2026 | 62 |
+| ASPLOS 2026 | 155 |
+| POPL 2026 | 92 |
+| PLDI 2026 | 108 |
+| CPP 2026 | 27 |
+| CAV 2026 | 82 |
+
+Always compare these numbers with the official table of contents before
+treating a collection as complete.
+
+## One-command workflow
+
+To collect all supported conferences for a year, apply exact publisher DOIs,
+and fetch abstracts in one run:
+
+```sh
+dune exec ./bin/piwana.exe -- --sync all 2026
+```
+
+`all` is case-insensitive and runs OSDI, SOSP, ASPLOS, POPL, PLDI, CPP, and CAV
+in that order. If one conference fails, the remaining conferences still run and
+the failed ones are reported at the end.
+
+To process a single conference instead:
+
+```sh
+dune exec ./bin/piwana.exe -- --sync SOSP 2026
+dune exec ./bin/piwana.exe -- --sync OSDI 2026
+dune exec ./bin/piwana.exe -- --sync ASPLOS 2026
+dune exec ./bin/piwana.exe -- --sync POPL 2026
+dune exec ./bin/piwana.exe -- --sync PLDI 2026
+dune exec ./bin/piwana.exe -- --sync CPP 2026
+dune exec ./bin/piwana.exe -- --sync CAV 2026
+```
+
+Then start the TUI:
+
+```sh
+dune exec ./bin/piwana.exe
+```
+
+`--sync` is an explicit user action. It applies only DOI values taken from the
+official/structured proceedings index for that exact edition. It never falls
+back to a fuzzy per-paper title search. Review decisions are not changed.
+
+## Separate collection steps
+
+Collection, DOI application, and abstract retrieval can also be run
+separately:
+
+```sh
+# 1. Collect papers and stage exact DOI candidates.
+dune exec ./bin/piwana.exe -- --collect SOSP 2026
+
+# 2. Apply exact proceedings DOI candidates for this edition.
+dune exec ./bin/piwana.exe -- --apply-dois SOSP 2026
+
+# 3. Fetch abstracts for this edition.
+dune exec ./bin/piwana.exe -- --fetch-abstracts SOSP 2026
+```
+
+`--resolve-dois` is the lower-level lookup command. It stages exact-title
+matches without assigning them:
+
+```sh
+dune exec ./bin/piwana.exe -- --resolve-dois SOSP 2026
+dune exec ./bin/piwana.exe -- --resolve-dois SOSP 2026 --refresh
+```
+
+By default, papers whose `doi_lookup_status` is already terminal
+(`success`, `candidate_found`, `not_found`, `ambiguous`, or `unsupported`) are
+not searched again. Use `--refresh` to repeat the lookup.
+
+For OSDI, DOI lookup deliberately does no network work:
+
+```text
+DOI lookup for OSDI 2026: skipped (USENIX proceedings do not expose DOI identifiers).
+No network requests were made; papers remain fully reviewable without DOI.
+```
+
+The status is recorded as `unsupported` so cron-like runs do not repeat it.
+
+## DOI policy
+
+The application no longer performs a Crossref title query for every paper.
+DOI discovery now follows the publisher edition:
+
+- The collector obtains the proceedings identity from the publisher metadata
+  (ACM proceedings DOI and exact container title, PACMPL issue, or Springer
+  book volume).
+- Articles are accepted only when the container title matches exactly and,
+  where applicable, the DOI belongs to the proceedings DOI prefix or the
+  requested PACMPL issue.
+- Exact-title matches are written to `doi_candidates` with
+  `source LIKE 'proceedings:%'`.
+- `papers.doi` is only changed by an explicit `--apply-dois` or `--sync`.
+  If a paper has multiple distinct exact candidates, it is marked
+  `ambiguous` and is not applied.
+- Non-exact titles are not saved. Old Crossref title-search candidates remain
+  in the database for audit but are ignored by `--apply-dois`.
+
+`doi_lookup_status` values:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` / empty | Not searched yet |
+| `candidate_found` | Exactly one exact DOI candidate staged |
+| `ambiguous` | Multiple distinct exact candidates; needs review |
+| `not_found` | No exact title match in the current edition |
+| `success` | DOI applied |
+| `unsupported` | Publisher does not expose DOIs (OSDI) |
+
+## Abstract retrieval
+
+```sh
+dune exec ./bin/piwana.exe -- --fetch-abstracts
+dune exec ./bin/piwana.exe -- --fetch-abstracts SOSP 2026
+```
+
+The fetcher tries Crossref first, then Semantic Scholar, OpenAlex, and (for ACM
+DOI pages) the ACM Digital Library HTML metadata. OpenAlex abstracts are
+reconstructed from `abstract_inverted_index`. Retrieval stops at the first
+non-empty abstract. It does not download PDFs.
+
+The `papers` table records `abstract_source`, `abstract_fetched_at`, and
+`abstract_status` (`pending`, `success`, or `not_found`). Records without an
+abstract remain visible and are not treated as successful. Papers marked
+`not_found` are retried by the next explicit `--fetch-abstracts` run.
 
 ## TUI keys
 
@@ -66,66 +199,38 @@ The fetch command only retries records with an empty abstract and status `pendin
 - `g` / `G`: jump to the beginning / end of the abstract
 - `q`: quit
 
-The selected paper detail pane wraps the abstract to the terminal width, shows its retrieval source, and pages long abstracts vertically. The paper list is limited to a viewport around the selected row so it does not push the abstract off-screen.
+The selected paper detail pane wraps the abstract to the terminal width, shows
+its retrieval source, and pages long abstracts vertically. The paper list is
+limited to a viewport around the selected row so it does not push the abstract
+off-screen.
+
+## Official proceedings and fallbacks
+
+ACM Digital Library pages are protected by a browser challenge in many
+automated environments. The collector first tries the ACM DL proceedings table
+of contents. If that is unavailable or incomplete, it uses Crossref metadata
+deposited by ACM, scoped to the exact proceedings container title and DOI
+prefix (or the PACMPL issue). This is a structured edition lookup, not a fuzzy
+per-paper search.
+
+Springer Nature Link may also present a bot challenge. The CAV collector first
+tries the official Springer conference/book pages, including the book volume
+list and paginated tables of contents. If those pages are unavailable or
+incomplete, it uses Crossref book-chapter metadata for the exact
+`Computer Aided Verification` container and publication year.
+
+Because the fallback is edition-scoped, a failure is reported as an empty or
+incomplete collection rather than being silently replaced with unrelated
+papers. Check the printed article counts against the official proceedings.
 
 ## Scope and limitations
 
-This is an initial DOI-to-abstract retrieval path, not the full proceedings collector. Coverage depends on whether the metadata providers have an abstract for a DOI. The next step is to test with several real DOI records and compare the results against the publishers' official proceedings. The current implementation uses the `curl` executable for HTTPS requests.
+This is a proceedings-and-abstract review tool, not a full bibliographic
+database. Coverage depends on whether the metadata providers have an abstract
+for a DOI. Publisher pages may block automated requests or omit
+machine-readable abstract metadata; in that case the paper remains available
+for review without an abstract.
 
-
-### Abstract retrieval sources
-
-The `--fetch-abstracts` command tries sources in this order: Crossref, Semantic Scholar, OpenAlex, and (for ACM DOI pages) the ACM Digital Library HTML metadata. OpenAlex abstracts are reconstructed from `abstract_inverted_index`. Retrieval stops at the first non-empty abstract. Failed attempts are retried on the next run. Publisher pages may block automated requests or omit machine-readable abstract metadata; in that case the paper remains unavailable rather than being treated as proof that no abstract exists.
-
-
-## Official proceedings collection (experimental)
-
-Collect OSDI papers from the official USENIX Technical Sessions page:
-
-```sh
-dune exec ./bin/piwana.exe -- --collect OSDI 2026
-```
-
-The collector stores a stable edition/title-derived ID, title, authors, abstract, official presentation URL, source page URL, and collection timestamp. It does not overwrite review decisions. OSDI records currently have no DOI unless one is resolved separately. This first parser is experimental: compare the reported number of parsed records against the official table of contents before treating a run as complete.
-
-The collector requires `curl` and network access. It adds `official_url`, `collection_source`, and `collected_at` columns automatically to existing databases.
-
-## DOI candidate discovery
-
-For an official-proceedings collection such as OSDI 2026, discover Crossref DOI
-candidates for records that do not yet have a DOI:
-
-```sh
-dune exec ./bin/piwana.exe -- --resolve-dois OSDI 2026
-```
-
-The command searches Crossref by title (five candidates per paper), records the
-results in the `doi_candidates` SQLite table, and prints exact-title and
-non-exact candidates. It deliberately **does not assign any DOI automatically**:
-identical titles, author-name variations, and publication-year differences need
-review before a DOI is written to `papers.doi`.
-
-Inspect exact-title candidates:
-
-```sql
-SELECT p.title, c.doi, c.candidate_title, c.candidate_authors,
-       c.candidate_year, c.score
-FROM doi_candidates c JOIN papers p ON p.id = c.paper_id
-WHERE p.conference = 'OSDI' AND p.year = '2026' AND c.exact_title = 1
-ORDER BY p.title, c.score DESC;
-```
-
-Inspect papers with no exact-title candidate:
-
-```sql
-SELECT p.title, c.doi, c.candidate_title, c.candidate_authors, c.candidate_year, c.score
-FROM papers p LEFT JOIN doi_candidates c ON c.paper_id = p.id
-WHERE p.conference = 'OSDI' AND p.year = '2026' AND (p.doi IS NULL OR p.doi = '')
-  AND NOT EXISTS (SELECT 1 FROM doi_candidates x
-                  WHERE x.paper_id = p.id AND x.exact_title = 1)
-ORDER BY p.title, c.score DESC;
-```
-
-Candidate discovery is repeatable; subsequent runs refresh the candidate rows.
-The `papers.doi` field remains unchanged until a separate, reviewed approval
-step is implemented.
+The database schema is migrated automatically when the application starts.
+Existing review state is preserved across collection, DOI application, and
+abstract retrieval.

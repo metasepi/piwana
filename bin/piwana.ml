@@ -94,6 +94,9 @@ let init_schema db =
   ensure_column "official_url" "TEXT";
   ensure_column "collection_source" "TEXT";
   ensure_column "collected_at" "TEXT";
+  ensure_column "doi_lookup_status" "TEXT";
+  ensure_column "doi_lookup_source" "TEXT";
+  ensure_column "doi_lookup_at" "TEXT";
   exec db "CREATE TABLE IF NOT EXISTS doi_candidates (    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,    source TEXT NOT NULL, doi TEXT NOT NULL, candidate_title TEXT NOT NULL DEFAULT '',    candidate_authors TEXT NOT NULL DEFAULT '', candidate_year TEXT NOT NULL DEFAULT '',    score REAL, exact_title INTEGER NOT NULL DEFAULT 0, retrieved_at TEXT NOT NULL,    PRIMARY KEY(paper_id,source,doi))"
 
 let scalar_int db sql =
@@ -264,6 +267,25 @@ let html_to_text s =
   let s = List.fold_left (fun acc (a,b) -> replace_all acc a b) s replacements in
   String.trim s
 
+let strip_abstract_label s =
+  let s = String.trim s in
+  let label = "abstract" in
+  let n = String.length label in
+  if String.length s > n &&
+     String.lowercase_ascii (String.sub s 0 n) = label
+  then
+    let rest = String.sub s n (String.length s - n) in
+    match rest.[0] with
+    | ' ' | '\t' | '\r' | '\n' | ':' | '.' | '-' ->
+        let rest = String.trim rest in
+        let rest =
+          if rest <> "" && (rest.[0] = ':' || rest.[0] = '-') then
+            String.trim (String.sub rest 1 (String.length rest - 1))
+          else rest in
+        if rest = "" then s else rest
+    | _ -> s
+  else s
+
 let crossref_record doi =
   let url = "https://api.crossref.org/works/" ^ percent_encode_path doi in
   match http_get url with
@@ -368,15 +390,22 @@ let acm_record doi =
 let update_paper_metadata db id source abstract title authors year =
   let stamp = sql_quote (now_iso ()) in
   exec db (Printf.sprintf
-    "UPDATE papers SET title=CASE WHEN %s='' THEN title ELSE %s END,authors=CASE WHEN %s='' THEN authors ELSE %s END,year=CASE WHEN %s='' THEN year ELSE %s END,metadata_source=%s,metadata_updated_at=%s,abstract_en=CASE WHEN %s='' THEN abstract_en ELSE %s END,abstract_source=CASE WHEN %s='' THEN abstract_source ELSE %s END,abstract_fetched_at=%s,abstract_status=%s,abstract_error=NULL WHERE id=%s"
+    "UPDATE papers SET title=CASE WHEN %s='' THEN title ELSE %s END,authors=CASE WHEN %s='' THEN authors ELSE %s END,year=CASE WHEN year='' THEN %s ELSE year END,metadata_source=%s,metadata_updated_at=%s,abstract_en=CASE WHEN %s='' THEN abstract_en ELSE %s END,abstract_source=CASE WHEN %s='' THEN abstract_source ELSE %s END,abstract_fetched_at=%s,abstract_status=%s,abstract_error=NULL WHERE id=%s"
     (sql_quote title) (sql_quote title) (sql_quote authors) (sql_quote authors)
-    (sql_quote year) (sql_quote year) (sql_quote source) stamp
+    (sql_quote year) (sql_quote source) stamp
     (sql_quote abstract) (sql_quote abstract) (sql_quote abstract) (sql_quote source)
     stamp (sql_quote (if abstract = "" then "not_found" else "success")) (sql_quote id))
 
-let fetch_abstracts db =
+let fetch_abstracts ?(conference="") ?(year="") db =
+  let filters = [
+    "doi IS NOT NULL"; "doi<>''"; "abstract_en=''";
+    "abstract_status IN ('pending','error','not_found')" ] in
+  let filters =
+    if conference = "" then filters else filters @ ["conference=" ^ sql_quote conference] in
+  let filters = if year = "" then filters else filters @ ["year=" ^ sql_quote year] in
+  let where = String.concat " AND " filters in
   let stmt = Sqlite3.prepare db
-    "SELECT id,doi FROM papers WHERE doi IS NOT NULL AND doi<>'' AND abstract_en='' AND abstract_status IN ('pending','error','not_found') ORDER BY conference,year,title" in
+    ("SELECT id,doi FROM papers WHERE " ^ where ^ " ORDER BY conference,year,title") in
   let rec collect acc = match Sqlite3.step stmt with
     | Sqlite3.Rc.ROW -> collect ((text_column stmt 0, text_column stmt 1) :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
@@ -402,7 +431,7 @@ let fetch_abstracts db =
              | Some (abstract, title, authors, year) when abstract <> "" ->
                  let fallback = match crossref with Some (_, t, a, y) -> (t,a,y) | None -> ("","","") in
                  let ft, fa, fy = fallback in
-                 Some (source, abstract,
+                 Some (source, strip_abstract_label abstract,
                    (if title <> "" then title else ft),
                    (if authors <> "" then authors else fa),
                    (if year <> "" then year else fy))
@@ -533,10 +562,10 @@ let collect_osdi db year =
         let stamp = sql_quote (now_iso ()) in
         let doi = "NULL" in
         exec db (Printf.sprintf
-          "INSERT INTO papers(id,doi,title,authors,conference,year,abstract_en,metadata_source,abstract_source,metadata_updated_at,abstract_fetched_at,abstract_status,official_url,collection_source,collected_at) VALUES(%s,%s,%s,%s,'OSDI',%s,%s,'usenix_official','usenix_official',%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET title=excluded.title,authors=excluded.authors,abstract_en=CASE WHEN excluded.abstract_en<>'' THEN excluded.abstract_en ELSE papers.abstract_en END,metadata_source='usenix_official',abstract_source=CASE WHEN excluded.abstract_en<>'' THEN 'usenix_official' ELSE papers.abstract_source END,metadata_updated_at=excluded.metadata_updated_at,abstract_fetched_at=CASE WHEN excluded.abstract_en<>'' THEN excluded.abstract_fetched_at ELSE papers.abstract_fetched_at END,abstract_status=CASE WHEN excluded.abstract_en<>'' THEN 'success' ELSE papers.abstract_status END,official_url=excluded.official_url,collection_source=excluded.collection_source,collected_at=excluded.collected_at"
+          "INSERT INTO papers(id,doi,title,authors,conference,year,abstract_en,metadata_source,abstract_source,metadata_updated_at,abstract_fetched_at,abstract_status,official_url,collection_source,collected_at,doi_lookup_status,doi_lookup_source,doi_lookup_at) VALUES(%s,%s,%s,%s,'OSDI',%s,%s,'usenix_official','usenix_official',%s,%s,%s,%s,%s,%s,'unsupported','usenix_official',%s) ON CONFLICT(id) DO UPDATE SET title=excluded.title,authors=excluded.authors,abstract_en=CASE WHEN excluded.abstract_en<>'' THEN excluded.abstract_en ELSE papers.abstract_en END,metadata_source='usenix_official',abstract_source=CASE WHEN excluded.abstract_en<>'' THEN 'usenix_official' ELSE papers.abstract_source END,metadata_updated_at=excluded.metadata_updated_at,abstract_fetched_at=CASE WHEN excluded.abstract_en<>'' THEN excluded.abstract_fetched_at ELSE papers.abstract_fetched_at END,abstract_status=CASE WHEN excluded.abstract_en<>'' THEN 'success' ELSE papers.abstract_status END,official_url=excluded.official_url,collection_source=excluded.collection_source,collected_at=excluded.collected_at,doi_lookup_status=CASE WHEN papers.doi IS NULL OR papers.doi='' THEN 'unsupported' ELSE papers.doi_lookup_status END,doi_lookup_source=CASE WHEN papers.doi IS NULL OR papers.doi='' THEN 'usenix_official' ELSE papers.doi_lookup_source END,doi_lookup_at=CASE WHEN papers.doi IS NULL OR papers.doi='' THEN excluded.doi_lookup_at ELSE papers.doi_lookup_at END"
           (sql_quote id) doi (sql_quote title) (sql_quote authors) (sql_quote year) (sql_quote abstract)
           stamp stamp (sql_quote (if abstract = "" then "not_found" else "success"))
-          (sql_quote official_url) (sql_quote url) stamp);
+          (sql_quote official_url) (sql_quote url) stamp stamp);
         if Sqlite3.changes db > 0 then incr inserted;
         exec db (Printf.sprintf "INSERT OR IGNORE INTO reviews(paper_id) VALUES(%s)" (sql_quote id))
       ) papers;
@@ -564,84 +593,706 @@ let percent_encode_component s =
     | _ -> Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
   Buffer.contents b
 
-let crossref_title_candidates title =
-  let url = "https://api.crossref.org/works?query.title=" ^ percent_encode_component title ^
-    "&rows=5" in
-  match http_get url with
-  | None -> []
-  | Some body ->
-      (try
-        let root = Yojson.Basic.from_string body in
-        let message = json_field "message" root in
-        match json_field "items" message with
-        | `List items -> List.filter_map (fun item ->
-            let doi = json_string (json_field "DOI" item) in
-            let candidate_title = match json_field "title" item with `List (`String t::_) -> t | _ -> "" in
-            if doi = "" || candidate_title = "" then None else
-            let candidate_authors = match json_field "author" item with
-              | `List xs -> String.concat ", " (List.filter ((<>) "") (List.map (fun a ->
-                  let given = json_string (json_field "given" a) in
-                  let family = json_string (json_field "family" a) in
-                  String.trim (given ^ " " ^ family)) xs))
-              | _ -> "" in
-            let candidate_year = json_year (json_field "published" item) in
-            let score = match json_field "score" item with `Float f -> Some f | `Int n -> Some (float_of_int n) | _ -> None in
-            Some (doi,candidate_title,candidate_authors,candidate_year,score)
-          ) items
-        | _ -> []
-       with _ -> [])
+(* ------------------------------------------------------------------ *)
+(* DOI policy and proceedings collectors                               *)
+(* ------------------------------------------------------------------ *)
 
-let resolve_dois db conference year =
+let starts_with s prefix =
+  String.length s >= String.length prefix &&
+  String.sub s 0 (String.length prefix) = prefix
+
+let unique_strings xs =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun x ->
+    if x = "" || Hashtbl.mem seen x then false
+    else (Hashtbl.add seen x (); true)) xs
+
+type proceedings_record = {
+  pr_doi : string;
+  pr_title : string;
+  pr_authors : string;
+  pr_source : string;
+}
+
+let dedup_records records =
+  let seen = Hashtbl.create 256 in
+  List.filter (fun r ->
+    let key = String.lowercase_ascii (String.trim r.pr_doi) in
+    if key = "" || Hashtbl.mem seen key then false
+    else (Hashtbl.add seen key (); true)) records
+
+let crossref_item_title item =
+  match json_field "title" item with
+  | `List (`String t :: _) -> strip_html t
+  | _ -> ""
+
+let crossref_item_authors item =
+  match json_field "author" item with
+  | `List xs ->
+      String.concat ", " (List.filter ((<>) "") (List.map (fun a ->
+        let given = json_string (json_field "given" a) in
+        let family = json_string (json_field "family" a) in
+        String.trim (given ^ " " ^ family)) xs))
+  | _ -> ""
+
+let crossref_has_container item container_title =
+  let wanted = normalize_title container_title in
+  match json_field "container-title" item with
+  | `List xs ->
+      List.exists (function
+        | `String s -> normalize_title (strip_html s) = wanted
+        | _ -> false) xs
+  | _ -> false
+
+let http_get_json_retry url =
+  let rec attempt tries =
+    match http_get url with
+    | Some body ->
+        (try Some (Yojson.Basic.from_string body)
+         with _ ->
+           if tries > 0 then (Unix.sleepf 1.0; attempt (tries - 1)) else None)
+    | None ->
+        if tries > 0 then (Unix.sleepf 1.0; attempt (tries - 1)) else None
+  in
+  attempt 2
+
+let crossref_query_articles ~container_title ~issue ~year ~parent_doi ~article_type =
+  let year_int = match int_of_string_opt year with Some y -> y | None -> 2026 in
+  let filter = Printf.sprintf
+    "type:%s,prefix:10.1145,from-pub-date:%04d-06-01,until-pub-date:%04d-06-30"
+    article_type (year_int - 1) (year_int + 1) in
+  let url = Printf.sprintf
+    "https://api.crossref.org/works?query.container-title=%s&filter=%s&rows=1000&select=DOI,title,container-title,issue,published,author"
+    (percent_encode_component container_title)
+    (percent_encode_component filter) in
+  match http_get_json_retry url with
+  | None -> []
+  | Some root ->
+      let message = json_field "message" root in
+      (match json_field "items" message with
+       | `List items ->
+           let records = List.filter_map (fun item ->
+             let doi = String.trim (json_string (json_field "DOI" item)) in
+             let title = crossref_item_title item in
+             let item_issue = json_string (json_field "issue" item) in
+             let published_year = json_year (json_field "published" item) in
+             let matches_container = crossref_has_container item container_title in
+             let matches_issue = match issue with
+               | None -> true
+               | Some wanted ->
+                   String.uppercase_ascii (String.trim item_issue) =
+                   String.uppercase_ascii (String.trim wanted) in
+             let matches_prefix = parent_doi = "" || starts_with doi (parent_doi ^ ".") in
+             let matches_year = parent_doi <> "" || published_year = year in
+             if doi <> "" && title <> "" && matches_container && matches_issue &&
+                matches_prefix && matches_year then
+               Some { pr_doi = doi; pr_title = title;
+                      pr_authors = crossref_item_authors item;
+                      pr_source = "crossref_proceedings" }
+             else None) items in
+           if List.length records >= 990 then
+             Printf.eprintf
+               "Warning: Crossref returned close to its 1000-row limit for %s; the article list may be incomplete.\n%!"
+               container_title;
+           records
+       | _ -> [])
+
+let parse_acm_toc html =
+  let anchor_re = Str.regexp_case_fold "<a[^>]*href=\"\\([^\"]+\\)\"[^>]*>" in
+  let close_re = Str.regexp_case_fold "</a>" in
+  let li_re = Str.regexp_case_fold "<li[^>]*>\\([^<]*\\)</li>" in
+  let doi_re = Str.regexp "/doi/\\(10\\.[^\"?#]+\\)" in
+  let labels = ["pdf"; "erider"; "abstract"; "full text"; "view"; "download"] in
+  let extract_doi href =
+    try
+      ignore (Str.search_forward doi_re href 0);
+      Some (Str.matched_group 1 href)
+    with Not_found -> None in
+  let authors_in block =
+    let rec collect pos acc =
+      try
+        ignore (Str.search_forward li_re block pos);
+        let author = strip_html (Str.matched_group 1 block) in
+        collect (Str.match_end ()) (if author = "" then acc else author :: acc)
+      with Not_found -> List.rev acc in
+    collect 0 [] in
+  let rec loop pos acc =
+    try
+      ignore (Str.search_forward anchor_re html pos);
+      let href = Str.matched_group 1 html in
+      let open_end = Str.match_end () in
+      (match extract_doi href with
+       | None -> loop open_end acc
+       | Some doi ->
+           ignore (Str.search_forward close_re html open_end);
+           let close_start = Str.match_beginning () in
+           let close_end = Str.match_end () in
+           let title = strip_html (String.sub html open_end (close_start - open_end)) in
+           let lower_title = String.lowercase_ascii title in
+           if title = "" || List.mem lower_title labels then loop close_end acc
+           else (
+             let block_end =
+               try
+                 ignore (Str.search_forward anchor_re html close_end);
+                 Str.match_beginning ()
+               with Not_found -> String.length html in
+             let block = String.sub html close_end (max 0 (block_end - close_end)) in
+             let authors = String.concat ", " (authors_in block) in
+             loop close_end
+               ({ pr_doi = doi; pr_title = title; pr_authors = authors;
+                  pr_source = "acm_dl" } :: acc)))
+    with Not_found -> List.rev acc
+  in
+  dedup_records (loop 0 [])
+
+type acm_edition = {
+  ae_conference : string;
+  ae_year : string;
+  ae_volumes : (string * string) list;
+  ae_issue : string option;
+  ae_type : string;
+}
+
+let acm_editions = [
+  { ae_conference = "SOSP"; ae_year = "2025";
+    ae_volumes = [("10.1145/3731569",
+      "Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles")];
+    ae_issue = None; ae_type = "proceedings-article" };
+  { ae_conference = "SOSP"; ae_year = "2026";
+    ae_volumes = [("10.1145/3830418",
+      "Proceedings of the ACM SIGOPS 32nd Symposium on Operating Systems Principles")];
+    ae_issue = None; ae_type = "proceedings-article" };
+  { ae_conference = "ASPLOS"; ae_year = "2025";
+    ae_volumes = [
+      ("10.1145/3669940",
+       "Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1");
+      ("10.1145/3676641",
+       "Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2");
+      ("10.1145/3676642",
+       "Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3")];
+    ae_issue = None; ae_type = "proceedings-article" };
+  { ae_conference = "ASPLOS"; ae_year = "2026";
+    ae_volumes = [
+      ("10.1145/3760250",
+       "Proceedings of the 31st ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1");
+      ("10.1145/3779212",
+       "Proceedings of the 31st ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2")];
+    ae_issue = None; ae_type = "proceedings-article" };
+  { ae_conference = "CPP"; ae_year = "2025";
+    ae_volumes = [("10.1145/3703595",
+      "Proceedings of the 14th ACM SIGPLAN International Conference on Certified Programs and Proofs")];
+    ae_issue = None; ae_type = "proceedings-article" };
+  { ae_conference = "CPP"; ae_year = "2026";
+    ae_volumes = [("10.1145/3779031",
+      "Proceedings of the 15th ACM SIGPLAN International Conference on Certified Programs and Proofs")];
+    ae_issue = None; ae_type = "proceedings-article" };
+  { ae_conference = "POPL"; ae_year = "2025";
+    ae_volumes = [("", "Proceedings of the ACM on Programming Languages")];
+    ae_issue = Some "POPL"; ae_type = "journal-article" };
+  { ae_conference = "POPL"; ae_year = "2026";
+    ae_volumes = [("", "Proceedings of the ACM on Programming Languages")];
+    ae_issue = Some "POPL"; ae_type = "journal-article" };
+  { ae_conference = "PLDI"; ae_year = "2025";
+    ae_volumes = [("", "Proceedings of the ACM on Programming Languages")];
+    ae_issue = Some "PLDI"; ae_type = "journal-article" };
+  { ae_conference = "PLDI"; ae_year = "2026";
+    ae_volumes = [("", "Proceedings of the ACM on Programming Languages")];
+    ae_issue = Some "PLDI"; ae_type = "journal-article" };
+]
+
+let find_acm_edition conference year =
+  List.find_opt (fun e -> e.ae_conference = conference && e.ae_year = year) acm_editions
+
+let acm_edition_key edition =
+  match edition.ae_volumes with
+  | (parent, _) :: _ when parent <> "" -> "acm:" ^ parent
+  | _ ->
+      let issue = match edition.ae_issue with Some i -> i | None -> "" in
+      "acm:pacmpl:" ^ issue ^ ":" ^ edition.ae_year
+
+let crossref_records_for_edition edition =
+  let records =
+    List.concat_map (fun (parent, container) ->
+      let rs = crossref_query_articles ~container_title:container
+        ~issue:edition.ae_issue ~year:edition.ae_year ~parent_doi:parent
+        ~article_type:edition.ae_type in
+      Printf.printf "  %s: %d article(s)\n%!"
+        (if parent = "" then container else parent) (List.length rs);
+      rs) edition.ae_volumes in
+  dedup_records records
+
+let fetch_acm_edition edition =
+  let official_records =
+    List.concat_map (fun (parent, _) ->
+      if parent = "" then []
+      else
+        let url = "https://dl.acm.org/doi/proceedings/" ^ percent_encode_path parent in
+        match http_get_html url with
+        | None -> []
+        | Some html ->
+            parse_acm_toc html
+            |> List.filter (fun r -> starts_with r.pr_doi (parent ^ ".")))
+      edition.ae_volumes
+    |> dedup_records in
+  let crossref_records = crossref_records_for_edition edition in
+  if official_records <> [] &&
+     (crossref_records = [] || List.length official_records >= List.length crossref_records)
+  then (official_records, "acm_dl")
+  else (
+    if official_records = [] then
+      Printf.printf
+        "ACM Digital Library table of contents unavailable; using Crossref publisher metadata (exact container and DOI prefix).\n%!"
+    else
+      Printf.printf
+        "ACM Digital Library table of contents was incomplete; using the complete Crossref edition metadata instead.\n%!";
+    (crossref_records, "crossref_proceedings"))
+
+let parse_springer_year_book html year =
+  let marker = "CAV " ^ year in
+  try
+    ignore (Str.search_forward (Str.regexp_string marker) html 0);
+    let tail = String.sub html (Str.match_end ()) (String.length html - Str.match_end ()) in
+    let re = Str.regexp "/book/\\(10\\.1007/[0-9.\\-]+\\)" in
+    ignore (Str.search_forward re tail 0);
+    Some (Str.matched_group 1 tail)
+  with Not_found -> None
+
+let parse_springer_book_links html =
+  let re = Str.regexp "/book/\\(10\\.1007/[0-9.\\-]+\\)" in
+  let rec loop pos acc =
+    try
+      ignore (Str.search_forward re html pos);
+      loop (Str.match_end ()) (Str.matched_group 1 html :: acc)
+    with Not_found -> List.rev acc
+  in
+  unique_strings (loop 0 [])
+
+let parse_springer_chapters html =
+  let start_re = Str.regexp_case_fold "<li[^>]*data-test=\"chapter\"[^>]*>" in
+  let doi_re = Str.regexp "/chapter/\\(10\\.1007/[0-9.\\-]+_[0-9]+\\)" in
+  let author_re = Str.regexp_case_fold
+    "<li[^>]*class=\"app-author-list__item\"[^>]*>\\([^<]*\\)</li>" in
+  let title_re = Str.regexp_case_fold
+    "data-test=\"chapter-title[^\"]*\"[^>]*>[ \t\r\n]*<a[^>]*>\\([^<]*\\)</a>" in
+  let rec blocks pos acc =
+    try
+      ignore (Str.search_forward start_re html pos);
+      let start = Str.match_beginning () in
+      let next =
+        try
+          ignore (Str.search_forward start_re html (Str.match_end ()));
+          Str.match_beginning ()
+        with Not_found -> String.length html in
+      let block = String.sub html start (max 0 (next - start)) in
+      let rec authors p a =
+        try
+          ignore (Str.search_forward author_re block p);
+          let author = strip_html (Str.matched_group 1 block) in
+          authors (Str.match_end ()) (if author = "" then a else author :: a)
+        with Not_found -> List.rev a in
+      let authors = String.concat ", " (authors 0 []) in
+      let record =
+        try
+          ignore (Str.search_forward doi_re block 0);
+          let doi = Str.matched_group 1 block in
+          let title =
+            try
+              ignore (Str.search_forward title_re block 0);
+              strip_html (Str.matched_group 1 block)
+            with Not_found -> "" in
+          let lower = String.lowercase_ascii title in
+          if title = "" || authors = "" ||
+             List.mem lower ["front matter"; "back matter"; "introduction"; "erratum"]
+          then None
+          else Some { pr_doi = doi; pr_title = title; pr_authors = authors;
+                      pr_source = "springer_link" }
+        with Not_found -> None in
+      blocks next (match record with Some r -> r :: acc | None -> acc)
+    with Not_found -> List.rev acc
+  in
+  dedup_records (blocks 0 [])
+
+let crossref_cav_records year =
+  let year_int = match int_of_string_opt year with Some y -> y | None -> 2026 in
+  let filter = Printf.sprintf
+    "type:book-chapter,from-pub-date:%04d-01-01,until-pub-date:%04d-12-31"
+    year_int year_int in
+  let url = Printf.sprintf
+    "https://api.crossref.org/works?query.container-title=%s&filter=%s&rows=1000&select=DOI,title,container-title,published,author"
+    (percent_encode_component "Computer Aided Verification")
+    (percent_encode_component filter) in
+  match http_get_json_retry url with
+  | None -> []
+  | Some root ->
+      let message = json_field "message" root in
+      (match json_field "items" message with
+       | `List items ->
+           List.filter_map (fun item ->
+             let doi = String.trim (json_string (json_field "DOI" item)) in
+             let title = crossref_item_title item in
+             let lower = String.lowercase_ascii title in
+             if doi <> "" && title <> "" &&
+                crossref_has_container item "Computer Aided Verification" &&
+                starts_with doi "10.1007/" &&
+                not (List.mem lower ["front matter"; "back matter"; "introduction"; "erratum"])
+             then Some { pr_doi = doi; pr_title = title;
+                         pr_authors = crossref_item_authors item;
+                         pr_source = "crossref_proceedings" }
+             else None) items
+       | _ -> [])
+
+let parse_springer_page_numbers html =
+  let re = Str.regexp "/book/\\([^\"?]+\\)\\?page=\\([0-9]+\\)" in
+  let rec loop pos acc =
+    try
+      ignore (Str.search_forward re html pos);
+      let page = int_of_string (Str.matched_group 2 html) in
+      loop (Str.match_end ()) (page :: acc)
+    with Not_found -> List.sort_uniq compare acc
+  in
+  loop 0 []
+
+let fetch_springer_book_chapters book =
+  let base = "https://link.springer.com/book/" ^ percent_encode_path book in
+  match http_get_html base with
+  | None -> []
+  | Some html ->
+      let first = parse_springer_chapters html in
+      let pages = parse_springer_page_numbers html |> List.filter (fun page -> page > 1) in
+      let rest = List.concat_map (fun page ->
+        let url = base ^ "?page=" ^ string_of_int page ^ "#toc" in
+        match http_get_html url with
+        | None -> []
+        | Some h -> parse_springer_chapters h) pages in
+      first @ rest
+
+let fetch_cav_edition year =
+  let conference_url = "https://link.springer.com/conference/cav" in
+  let official_records =
+    match http_get_html conference_url with
+    | None -> []
+    | Some html ->
+        (match parse_springer_year_book html year with
+         | None -> []
+         | Some first_book ->
+             let book_url = "https://link.springer.com/book/" ^ percent_encode_path first_book in
+             (match http_get_html book_url with
+              | None -> []
+              | Some book_html ->
+                  let books = unique_strings (first_book :: parse_springer_book_links book_html) in
+                  Printf.printf "Springer CAV %s: %d volume(s)\n%!" year (List.length books);
+                  List.concat_map fetch_springer_book_chapters books))
+    |> dedup_records in
+  let crossref_records = dedup_records (crossref_cav_records year) in
+  if official_records <> [] &&
+     (crossref_records = [] || List.length official_records >= List.length crossref_records)
+  then (official_records, "springer_link")
+  else (
+    if official_records = [] then
+      Printf.printf
+        "Springer book table of contents unavailable; using Crossref book-chapter metadata.\n%!"
+    else
+      Printf.printf
+        "Springer book table of contents was incomplete; using the complete Crossref edition metadata instead.\n%!";
+    (crossref_records, "crossref_proceedings"))
+
+let find_paper_id_by_doi db doi =
+  let stmt = Sqlite3.prepare db "SELECT id FROM papers WHERE doi=?1 LIMIT 1" in
+  ignore (Sqlite3.bind stmt 1 (Sqlite3.Data.TEXT doi));
+  let result =
+    match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW -> Some (text_column stmt 0)
+    | _ -> None in
+  ignore (Sqlite3.finalize stmt);
+  result
+
+let upsert_proceedings_records db conference year records =
+  let stamp = sql_quote (now_iso ()) in
+  let touched = ref 0 in
+  List.iter (fun r ->
+    let id =
+      match find_paper_id_by_doi db r.pr_doi with
+      | Some existing -> existing
+      | None -> "doi:" ^ r.pr_doi in
+    let official_url = "https://doi.org/" ^ r.pr_doi in
+    let collection_source = "proceedings:" ^ r.pr_source in
+    exec db (Printf.sprintf
+      "INSERT INTO papers(id,title,authors,conference,year,abstract_status,metadata_source,metadata_updated_at,official_url,collection_source,collected_at) VALUES(%s,%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s) \
+       ON CONFLICT(id) DO UPDATE SET title=excluded.title,authors=CASE WHEN excluded.authors<>'' THEN excluded.authors ELSE papers.authors END,conference=excluded.conference,year=excluded.year,metadata_source=excluded.metadata_source,metadata_updated_at=excluded.metadata_updated_at,official_url=excluded.official_url,collection_source=excluded.collection_source,collected_at=excluded.collected_at"
+      (sql_quote id) (sql_quote r.pr_title) (sql_quote r.pr_authors)
+      (sql_quote conference) (sql_quote year) (sql_quote r.pr_source)
+      stamp (sql_quote official_url) (sql_quote collection_source) stamp);
+    if Sqlite3.changes db > 0 then incr touched;
+    exec db (Printf.sprintf "INSERT OR IGNORE INTO reviews(paper_id) VALUES(%s)" (sql_quote id))
+  ) records;
+  !touched
+
+type doi_stage_stats = {
+  ds_checked : int;
+  ds_staged : int;
+  ds_exact : int;
+  ds_missing : int;
+  ds_ambiguous : int;
+  ds_skipped : int;
+}
+
+let doi_status_is_terminal status =
+  match String.lowercase_ascii status with
+  | "success" | "candidate_found" | "not_found" | "ambiguous" | "unsupported" -> true
+  | _ -> false
+
+let stage_proceedings_candidates db conference year edition_key records ~refresh =
   let stmt = Sqlite3.prepare db
-    "SELECT id,title,authors,year FROM papers WHERE conference=?1 AND year=?2 AND (doi IS NULL OR doi='') AND official_url IS NOT NULL AND official_url<>'' ORDER BY title" in
+    "SELECT id,title,COALESCE(doi_lookup_status,'') FROM papers \
+     WHERE conference=?1 AND year=?2 AND (doi IS NULL OR doi='') ORDER BY title" in
   ignore (Sqlite3.bind stmt 1 (Sqlite3.Data.TEXT conference));
   ignore (Sqlite3.bind stmt 2 (Sqlite3.Data.TEXT year));
   let rec read acc = match Sqlite3.step stmt with
-    | Sqlite3.Rc.ROW -> read ((text_column stmt 0,text_column stmt 1,text_column stmt 2,text_column stmt 3)::acc)
+    | Sqlite3.Rc.ROW ->
+        read ((text_column stmt 0, text_column stmt 1, text_column stmt 2) :: acc)
     | Sqlite3.Rc.DONE -> List.rev acc
-    | rc -> check_rc "Selecting DOI candidates" rc; List.rev acc
+    | rc -> check_rc "Selecting papers for DOI staging" rc; List.rev acc
   in
-  let papers = read [] in
+  let all = read [] in
   ignore (Sqlite3.finalize stmt);
-  let exact_count = ref 0 and candidate_count = ref 0 and no_match = ref 0 in
-  Printf.printf "Resolving missing DOIs for %s %s: %d paper(s)\n%!" conference year (List.length papers);
-  List.iter (fun (id,title,authors,paper_year) ->
-    Printf.printf "\n%s\n  %s\n%!" id title;
-    Unix.sleepf 0.25;
-    let candidates = crossref_title_candidates title in
-    let exact = List.filter (fun (_,t,_,_,_) -> normalize_title t = normalize_title title) candidates in
-    List.iter (fun (doi,t,a,y,score) ->
-      exec db (Printf.sprintf
-        "INSERT INTO doi_candidates(paper_id,source,doi,candidate_title,candidate_authors,candidate_year,score,exact_title,retrieved_at) VALUES(%s,'crossref',%s,%s,%s,%s,%s,%d,%s) ON CONFLICT(paper_id,source,doi) DO UPDATE SET candidate_title=excluded.candidate_title,candidate_authors=excluded.candidate_authors,candidate_year=excluded.candidate_year,score=excluded.score,exact_title=excluded.exact_title,retrieved_at=excluded.retrieved_at"
-        (sql_quote id) (sql_quote doi) (sql_quote t) (sql_quote a) (sql_quote y)
-        (match score with Some f -> Printf.sprintf "%g" f | None -> "NULL")
-        (if normalize_title t = normalize_title title then 1 else 0) (sql_quote (now_iso ())))
-    ) candidates;
-    candidate_count := !candidate_count + List.length candidates;
-    if exact <> [] then (
-      incr exact_count;
-      Printf.printf "  EXACT TITLE CANDIDATE(S): %d (not assigned automatically)\n%!" (List.length exact);
-      List.iter (fun (doi,t,a,y,score) ->
-        Printf.printf "    DOI: %s\n    Authors: %s\n    Year: %s (paper year: %s)\n    Crossref score: %s\n%!"
-          doi (if a = "" then "(not supplied)" else a)
-          (if y = "" then "(not supplied)" else y) paper_year
-          (match score with Some f -> Printf.sprintf "%.2f" f | None -> "(not supplied)");
-        ignore t
-      ) exact
-    ) else (
-      incr no_match;
-      Printf.printf "  NO EXACT TITLE MATCH: %d candidate(s) staged for review\n%!" (List.length candidates);
-      List.iter (fun (doi,t,a,y,score) ->
-        Printf.printf "    %s  %s%s\n%!" doi t
-          (match score with Some f -> Printf.sprintf " [score %.2f]" f | None -> "");
-        ignore a; ignore y
-      ) candidates
-    );
-    ignore authors
-  ) papers;
-  Printf.printf "\nDOI candidate search: %d papers with exact-title candidates, %d without exact title match, %d candidate records staged.\n%!"
-    !exact_count !no_match !candidate_count;
-  print_endline "No DOI values were assigned. Review candidates before applying any DOI."
+  let selected =
+    if refresh then all
+    else List.filter (fun (_, _, status) -> not (doi_status_is_terminal status)) all in
+  let skipped = List.length all - List.length selected in
+  let by_title = Hashtbl.create 256 in
+  List.iter (fun r ->
+    let key = normalize_title r.pr_title in
+    let previous = try Hashtbl.find by_title key with Not_found -> [] in
+    Hashtbl.replace by_title key (r :: previous)) records;
+  let source = "proceedings:" ^ edition_key in
+  let stamp = sql_quote (now_iso ()) in
+  let staged = ref 0 and exact = ref 0 and missing = ref 0 and ambiguous = ref 0 in
+  List.iter (fun (id, title, _) ->
+    exec db (Printf.sprintf
+      "DELETE FROM doi_candidates WHERE paper_id=%s AND source LIKE 'proceedings:%%'"
+      (sql_quote id));
+    let matches =
+      try Hashtbl.find by_title (normalize_title title) with Not_found -> [] in
+    let matches = dedup_records matches in
+    List.iter
+      (fun r ->
+         let sql = Printf.sprintf
+           "INSERT INTO doi_candidates(paper_id,source,doi,candidate_title,candidate_authors,candidate_year,score,exact_title,retrieved_at) VALUES(%s,%s,%s,%s,%s,%s,NULL,1,%s) \
+            ON CONFLICT(paper_id,source,doi) DO UPDATE SET candidate_title=excluded.candidate_title,candidate_authors=excluded.candidate_authors,candidate_year=excluded.candidate_year,score=NULL,exact_title=1,retrieved_at=excluded.retrieved_at"
+           (sql_quote id) (sql_quote source) (sql_quote r.pr_doi)
+           (sql_quote r.pr_title) (sql_quote r.pr_authors) (sql_quote year)
+           (sql_quote (now_iso ())) in
+         exec db sql)
+      matches;
+    staged := !staged + List.length matches;
+    let status =
+      if List.length matches = 1 then (incr exact; "candidate_found")
+      else if List.length matches > 1 then (incr ambiguous; "ambiguous")
+      else (incr missing; "not_found") in
+    exec db (Printf.sprintf
+      "UPDATE papers SET doi_lookup_status=%s,doi_lookup_source=%s,doi_lookup_at=%s WHERE id=%s"
+      (sql_quote status) (sql_quote source) stamp (sql_quote id))
+  ) selected;
+  { ds_checked = List.length selected; ds_staged = !staged; ds_exact = !exact;
+    ds_missing = !missing; ds_ambiguous = !ambiguous; ds_skipped = skipped }
+
+let print_stage_summary conference year stats =
+  Printf.printf
+    "DOI lookup for %s %s: %d paper(s) checked, %d exact-title DOI candidate(s) staged, %d without a match, %d ambiguous, %d previously searched.\n%!"
+    conference year stats.ds_checked stats.ds_staged stats.ds_missing
+    stats.ds_ambiguous stats.ds_skipped;
+  if stats.ds_staged > 0 then
+    Printf.printf
+      "No DOI values were assigned automatically. Run --apply-dois %s %s to apply the exact proceedings matches.\n%!"
+      conference year
+
+let mark_osdi_doi_unsupported db year =
+  let missing = scalar_int db (Printf.sprintf
+    "SELECT COUNT(*) FROM papers WHERE conference='OSDI' AND year=%s AND (doi IS NULL OR doi='')"
+    (sql_quote year)) in
+  exec db (Printf.sprintf
+    "UPDATE papers SET doi_lookup_status='unsupported',doi_lookup_source='usenix_official',doi_lookup_at=%s \
+     WHERE conference='OSDI' AND year=%s AND (doi IS NULL OR doi='')"
+    (sql_quote (now_iso ())) (sql_quote year));
+  Printf.printf "DOI lookup for OSDI %s: skipped (USENIX proceedings do not expose DOI identifiers).\n" year;
+  print_endline "No network requests were made; papers remain fully reviewable without DOI.";
+  Printf.printf "Recorded 'unsupported' for %d paper(s) to avoid repeated lookups.\n%!" missing
+
+let count_papers db conference year =
+  scalar_int db (Printf.sprintf
+    "SELECT COUNT(*) FROM papers WHERE conference=%s AND year=%s"
+    (sql_quote conference) (sql_quote year))
+
+let count_pending_doi_lookups db conference year =
+  scalar_int db (Printf.sprintf
+    "SELECT COUNT(*) FROM papers WHERE conference=%s AND year=%s AND (doi IS NULL OR doi='') \
+     AND COALESCE(doi_lookup_status,'') NOT IN ('success','candidate_found','not_found','ambiguous','unsupported')"
+    (sql_quote conference) (sql_quote year))
+
+let collect_acm db conference year =
+  match find_acm_edition conference year with
+  | None ->
+      failwith (Printf.sprintf
+        "No ACM proceedings configuration for %s %s. Supported ACM editions: SOSP/ASPLOS/POPL/PLDI/CPP 2025-2026."
+        conference year)
+  | Some edition ->
+      let records, source = fetch_acm_edition edition in
+      if records = [] then
+        failwith (Printf.sprintf "No articles found for %s %s." conference year);
+      let touched = upsert_proceedings_records db conference year records in
+      let stats = stage_proceedings_candidates db conference year
+        (acm_edition_key edition) records ~refresh:true in
+      Printf.printf
+        "%s %s collection: %d article(s) from %s; %d row(s) inserted or updated; %d exact DOI candidate(s) staged.\n%!"
+        conference year (List.length records) source touched stats.ds_staged
+
+let collect_cav db year =
+  let records, source = fetch_cav_edition year in
+  if records = [] then failwith (Printf.sprintf "No articles found for CAV %s." year);
+  let touched = upsert_proceedings_records db "CAV" year records in
+  let stats = stage_proceedings_candidates db "CAV" year
+    ("springer:cav:" ^ year) records ~refresh:true in
+  Printf.printf
+    "CAV %s collection: %d article(s) from %s; %d row(s) inserted or updated; %d exact DOI candidate(s) staged.\n%!"
+    year (List.length records) source touched stats.ds_staged
+
+let resolve_dois db conference year ~refresh =
+  match conference with
+  | "OSDI" -> mark_osdi_doi_unsupported db year
+  | "SOSP" | "ASPLOS" | "PLDI" | "POPL" | "CPP" ->
+      let total = count_papers db conference year in
+      if total = 0 then
+        Printf.printf
+          "No %s %s papers in the database yet. Run --collect %s %s first.\n%!"
+          conference year conference year
+      else if not refresh && count_pending_doi_lookups db conference year = 0 then
+        Printf.printf
+          "DOI lookup for %s %s: all %d paper(s) already have a lookup status; use --refresh to search again.\n%!"
+          conference year total
+      else (
+        match find_acm_edition conference year with
+        | None ->
+            failwith (Printf.sprintf "No ACM proceedings configuration for %s %s." conference year)
+        | Some edition ->
+            let records, source = fetch_acm_edition edition in
+            if records = [] then
+              failwith (Printf.sprintf "No articles found for %s %s." conference year);
+            Printf.printf "Using %s for %s %s.\n%!" source conference year;
+            let stats = stage_proceedings_candidates db conference year
+              (acm_edition_key edition) records ~refresh in
+            print_stage_summary conference year stats)
+  | "CAV" ->
+      let total = count_papers db "CAV" year in
+      if total = 0 then
+        Printf.printf
+          "No CAV %s papers in the database yet. Run --collect CAV %s first.\n%!" year year
+      else if not refresh && count_pending_doi_lookups db "CAV" year = 0 then
+        Printf.printf
+          "DOI lookup for CAV %s: all %d paper(s) already have a lookup status; use --refresh to search again.\n%!"
+          year total
+      else (
+        let records, source = fetch_cav_edition year in
+        if records = [] then failwith (Printf.sprintf "No articles found for CAV %s." year);
+        Printf.printf "Using %s for CAV %s.\n%!" source year;
+        let stats = stage_proceedings_candidates db "CAV" year
+          ("springer:cav:" ^ year) records ~refresh in
+        print_stage_summary "CAV" year stats)
+  | _ ->
+      failwith (Printf.sprintf
+        "DOI lookup is not implemented for %s. Supported conferences: OSDI, SOSP, ASPLOS, PLDI, POPL, CPP, CAV."
+        conference)
+
+let doi_taken_by_other db doi id =
+  let stmt = Sqlite3.prepare db "SELECT id FROM papers WHERE doi=?1 AND id<>?2 LIMIT 1" in
+  ignore (Sqlite3.bind stmt 1 (Sqlite3.Data.TEXT doi));
+  ignore (Sqlite3.bind stmt 2 (Sqlite3.Data.TEXT id));
+  let found = match Sqlite3.step stmt with Sqlite3.Rc.ROW -> true | _ -> false in
+  ignore (Sqlite3.finalize stmt);
+  found
+
+let apply_exact_dois db conference year =
+  let stmt = Sqlite3.prepare db
+    "SELECT p.id,p.title,c.doi FROM papers p JOIN doi_candidates c ON c.paper_id=p.id \
+     WHERE p.conference=?1 AND p.year=?2 AND (p.doi IS NULL OR p.doi='') \
+       AND c.exact_title=1 AND c.source LIKE 'proceedings:%' ORDER BY p.id,c.doi" in
+  ignore (Sqlite3.bind stmt 1 (Sqlite3.Data.TEXT conference));
+  ignore (Sqlite3.bind stmt 2 (Sqlite3.Data.TEXT year));
+  let rec read acc = match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW ->
+        read ((text_column stmt 0, text_column stmt 1, text_column stmt 2) :: acc)
+    | Sqlite3.Rc.DONE -> List.rev acc
+    | rc -> check_rc "Selecting exact DOI candidates" rc; List.rev acc
+  in
+  let rows = read [] in
+  ignore (Sqlite3.finalize stmt);
+  let table = Hashtbl.create 256 in
+  List.iter (fun (id, title, doi) ->
+    let previous = try Hashtbl.find table id with Not_found -> (title, []) in
+    let _, dois = previous in
+    Hashtbl.replace table id (title, unique_strings (doi :: dois))) rows;
+  let applied = ref 0 and conflicts = ref 0 in
+  Hashtbl.iter (fun id (title, dois) ->
+    match dois with
+    | [doi] ->
+        if doi_taken_by_other db doi id then (
+          incr conflicts;
+          Printf.printf "  CONFLICT: %s -> %s is already assigned to another record; not applied.\n%!" title doi)
+        else (
+          exec db (Printf.sprintf
+            "UPDATE papers SET doi=%s,doi_lookup_status='success',doi_lookup_source='proceedings',doi_lookup_at=%s,metadata_updated_at=%s WHERE id=%s"
+            (sql_quote doi) (sql_quote (now_iso ())) (sql_quote (now_iso ())) (sql_quote id));
+          incr applied;
+          Printf.printf "  DOI %s -> %s\n%!" doi title)
+    | _ ->
+        incr conflicts;
+        exec db (Printf.sprintf
+          "UPDATE papers SET doi_lookup_status='ambiguous',doi_lookup_at=%s WHERE id=%s"
+          (sql_quote (now_iso ())) (sql_quote id));
+        Printf.printf "  CONFLICT: %s has %d distinct exact DOI candidates; not applied.\n%!"
+          title (List.length dois)
+  ) table;
+  Printf.printf "Applied %d exact DOI(s) to %s %s; %d conflict(s).\n%!"
+    !applied conference year !conflicts;
+  if !applied = 0 then
+    print_endline "No exact DOI candidates were applied. Review the collection and DOI staging output."
+  else
+    print_endline "Review decisions were not changed. Run --fetch-abstracts to retrieve abstracts for the new DOIs."
+
+let supported_conferences = ["OSDI"; "SOSP"; "ASPLOS"; "POPL"; "PLDI"; "CPP"; "CAV"]
+
+let collect_by_conference db conference year =
+  match conference with
+  | "OSDI" -> collect_osdi db year
+  | "SOSP" | "ASPLOS" | "PLDI" | "POPL" | "CPP" -> collect_acm db conference year
+  | "CAV" -> collect_cav db year
+  | _ ->
+      failwith (Printf.sprintf
+        "Collection is not implemented for %s. Supported conferences: OSDI, SOSP, ASPLOS, PLDI, POPL, CPP, CAV."
+        conference)
+
+let sync_conference db conference year =
+  collect_by_conference db conference year;
+  (match conference with
+   | "OSDI" -> mark_osdi_doi_unsupported db year
+   | _ -> apply_exact_dois db conference year);
+  fetch_abstracts ~conference:conference ~year:year db
+
+let sync_all_conferences db year =
+  let failures = ref [] in
+  let record_failure conference message =
+    Printf.eprintf "Skipping %s %s: %s\n%!" conference year message;
+    failures := conference :: !failures in
+  List.iter (fun conference ->
+    Printf.printf "\n=== %s %s ===\n%!" conference year;
+    try sync_conference db conference year
+    with
+    | Failure msg -> record_failure conference msg
+    | exn -> record_failure conference (Printexc.to_string exn)) supported_conferences;
+  match List.rev !failures with
+  | [] -> ()
+  | failed ->
+      failwith (Printf.sprintf
+        "Sync completed with errors for: %s" (String.concat ", " failed))
 
 let query_osdi_official_rows db year =
   let stmt = Sqlite3.prepare db
@@ -817,17 +1468,31 @@ let main () =
       import_dois db Sys.argv.(2); ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--fetch-abstracts" then (
-      fetch_abstracts db; ignore (Sqlite3.db_close db); exit 0
+      let conference = if Array.length Sys.argv > 2 then String.uppercase_ascii Sys.argv.(2) else "" in
+      let year = if Array.length Sys.argv > 3 then Sys.argv.(3) else "" in
+      fetch_abstracts ~conference ~year db; ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--resolve-dois" && Array.length Sys.argv > 3 then (
-      resolve_dois db (String.uppercase_ascii Sys.argv.(2)) Sys.argv.(3);
+      let refresh = Array.length Sys.argv > 4 && Sys.argv.(4) = "--refresh" in
+      resolve_dois db (String.uppercase_ascii Sys.argv.(2)) Sys.argv.(3) ~refresh;
+      ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--apply-dois" && Array.length Sys.argv > 3 then (
+      apply_exact_dois db (String.uppercase_ascii Sys.argv.(2)) Sys.argv.(3);
+      ignore (Sqlite3.db_close db); exit 0
+    );
+    if command = "--sync" && Array.length Sys.argv > 3 then (
+      let target = String.uppercase_ascii Sys.argv.(2) in
+      if target = "ALL" then sync_all_conferences db Sys.argv.(3)
+      else sync_conference db target Sys.argv.(3);
       ignore (Sqlite3.db_close db); exit 0
     );
     if command = "--verify" && Array.length Sys.argv > 3 && String.uppercase_ascii Sys.argv.(2) = "OSDI" then (
       verify_osdi db Sys.argv.(3); ignore (Sqlite3.db_close db); exit 0
     );
-    if command = "--collect" && Array.length Sys.argv > 3 && String.uppercase_ascii Sys.argv.(2) = "OSDI" then (
-      collect_osdi db Sys.argv.(3); ignore (Sqlite3.db_close db); exit 0
+    if command = "--collect" && Array.length Sys.argv > 3 then (
+      collect_by_conference db (String.uppercase_ascii Sys.argv.(2)) Sys.argv.(3);
+      ignore (Sqlite3.db_close db); exit 0
     );
     let tsv_path = if command <> "" && command.[0] <> '-' then command else "papers.tsv" in
     ensure_seed_data db tsv_path;
@@ -861,4 +1526,7 @@ let main () =
     ignore (Sqlite3.db_close db)
   with exn -> ignore (Sqlite3.db_close db); raise exn
 
-let () = main ()
+let () =
+  try main () with
+  | Failure msg -> prerr_endline ("piwana: " ^ msg); exit 1
+  | Sys_error msg -> prerr_endline ("piwana: " ^ msg); exit 1
