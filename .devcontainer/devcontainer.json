@@ -21,7 +21,7 @@
     "source=${localEnv:HOME}/github/dot.copilot,target=/home/vscode/.copilot,type=bind",
     "source=${localEnv:HOME}/github/dot.config-gh-metasepi,target=/home/vscode/.config/gh,type=bind"
   ],
-  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude && sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep time libsqlite3-dev curl && sudo npm install -g @openai/codex && sudo npm install -g @opencode/cli && opam update && opam install -y dune sqlite3 yojson && gh auth setup-git && git config --global url.https://github.com/.insteadOf git@github.com: && git config rerere.enabled true && git config pull.rebase merges",
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude /home/vscode/.local && sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep time libsqlite3-dev curl && sudo npm install -g @openai/codex && sudo npm install -g @opencode/cli && opam update && opam install -y dune sqlite3 yojson && gh auth setup-git && git config --global url.https://github.com/.insteadOf git@github.com: && git config rerere.enabled true && git config pull.rebase merges",
   "containerEnv": {
     "LANG": "en_US.UTF-8",
     "LC_ALL": "en_US.UTF-8",
