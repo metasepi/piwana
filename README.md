@@ -354,3 +354,7 @@ for review without an abstract.
 The database schema is migrated automatically when the application starts.
 Existing review state is preserved across collection, DOI application, and
 abstract retrieval.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
